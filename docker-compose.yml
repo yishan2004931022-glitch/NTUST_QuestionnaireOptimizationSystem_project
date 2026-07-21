@@ -1,0 +1,33 @@
+name: survey-copilot
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: survey-copilot-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./:/app:cached
+      - ./admin-web:/app/admin-web:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - SESSION_DIR=/app/data/latest_session
+      - SESSION_USER_ISOLATION=${SESSION_USER_ISOLATION:-false}
+      - SESSION_USER_ROOT=${SESSION_USER_ROOT:-/app/data/users}
+      - SESSION_TOKEN_TTL=${SESSION_TOKEN_TTL:-86400}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - FRONTEND_DIR=/app/admin-web
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

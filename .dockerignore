@@ -1,0 +1,15 @@
+__pycache__
+.git
+.gitignore
+.env
+.venv
+venv
+node_modules
+dist
+build
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.hermes
+.AppData
