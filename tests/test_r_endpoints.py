@@ -13,16 +13,18 @@ import shutil
 import pytest
 import numpy as np
 import pandas as pd
+import tempfile
 
 from fastapi.testclient import TestClient
-from app.main import app, SESSION
+from app.main import app, _inprocess_sessions
+from app.session_store import save_session, load_session, clear_session
 
 
 @pytest.fixture(autouse=True)
 def session_clean():
-    SESSION.clear()
+    _inprocess_sessions.clear()
     yield
-    SESSION.clear()
+    _inprocess_sessions.clear()
 
 # R availability: prefer PATH, fall back to default install location.
 try:
@@ -68,9 +70,22 @@ def structural_model():
     }
 
 
+def _make_client():
+    _inprocess_sessions.clear()
+    return TestClient(app)
+
+
+def _upload_synthetic(client, df):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+        df.to_csv(tmp.name, index=False)
+        files = {"file": ("survey.csv", open(tmp.name, "rb").read(), "text/csv")}
+        return client.post("/upload", files=files)
+
+
 def _inject_session(synthetic_df, construct_dict):
-    SESSION["df"] = synthetic_df
-    SESSION["construct_dict"] = construct_dict
+    _inprocess_sessions.setdefault("user_session_default", {}).update(
+        {"df": synthetic_df, "construct_dict": construct_dict}
+    )
 
 
 r_not_available = shutil.which("Rscript") is None
@@ -89,8 +104,7 @@ class TestEFAEndpoint:
 
     @pytest.mark.skipif(r_not_available, reason="Rscript not installed locally")
     def test_efa_requires_data(self):
-        client = TestClient(app)
-        r = client.post("/analyze/efa", json={"max_factors": 2})
+        r = _make_client().post("/analyze/efa", json={"max_factors": 2})
         assert r.status_code == 400
 
 
@@ -111,9 +125,8 @@ class TestDeletedAlphaEndpoint:
         r = client.post("/analyze/deleted-alpha", json={"items": ["TR1", "TR2"]})
         assert r.status_code == 400
 
-    def test_deleted_alpha_without_r_returns_200(self, synthetic_df, construct_dict, monkeypatch):
-        monkeypatch.setitem(SESSION, "df", synthetic_df)
-        monkeypatch.setitem(SESSION, "construct_dict", construct_dict)
+    def test_deleted_alpha_without_r_returns_200(self, synthetic_df, construct_dict):
+        _inject_session(synthetic_df, construct_dict)
         client = TestClient(app)
         r = client.post("/analyze/deleted-alpha", json={"items": construct_dict["Trust"]})
         assert r.status_code == 200
@@ -135,8 +148,7 @@ class TestSeminrEndpoint:
 
     @pytest.mark.skipif(r_not_available, reason="Rscript not installed locally")
     def test_seminr_no_data(self):
-        client = TestClient(app)
-        r = client.post("/analyze/seminr", json={
+        r = _make_client().post("/analyze/seminr", json={
             "measurement": {"Trust": ["TR1", "TR2"]},
             "structural": {"Performance": ["Trust"]},
         })
@@ -145,6 +157,5 @@ class TestSeminrEndpoint:
     @pytest.mark.skipif(r_not_available, reason="Rscript not installed locally")
     def test_seminr_missing_models(self, synthetic_df, construct_dict):
         _inject_session(synthetic_df, construct_dict)
-        client = TestClient(app)
-        r = client.post("/analyze/seminr", json={})
+        r = _make_client().post("/analyze/seminr", json={})
         assert r.status_code == 400

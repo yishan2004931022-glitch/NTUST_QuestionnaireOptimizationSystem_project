@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Survey Co-Pilot - 問卷優化平台</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --text: #1f2d3d;
+      --muted: #5a6b7c;
+      --border: #e3e8ee;
+      --accent-1: #4a90d9;
+      --accent-2: #6b4fa1;
+      --success: #2e7d32;
+      --warn: #c2410c;
+      --error: #c62828;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, "Segoe UI", "Microsoft JhengHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 24px;
+      background: linear-gradient(90deg, #1f2d3d, #2a3f52);
+      color: #fff;
+    }
+    header h1 { margin: 0; font-size: 18px; letter-spacing: 0.5px; }
+    .pill {
+      background: rgba(255,255,255,0.15);
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+    }
+    main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+    .nav {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .nav-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      cursor: pointer;
+      text-align: center;
+      transition: 0.15s ease;
+    }
+    .nav-item:hover { transform: translateY(-2px); border-color: var(--accent-1); }
+    .nav-item h3 { margin: 6px 0 0; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .nav-item .num { font-size: 20px; font-weight: 700; }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 18px;
+    }
+    .panel h2 { margin: 0 0 12px; font-size: 16px; }
+    input, select, textarea, button {
+      font-family: inherit;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      margin: 4px 0 10px;
+      width: 100%;
+    }
+    button { background: var(--accent-1); color: #fff; border: 0; cursor: pointer; font-weight: 600; }
+    button.secondary { background: #7b8a99; }
+    button.ghost { background: #eef2f5; color: #1f2d3d; border: 1px solid var(--border); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 768px) { .row { grid-template-columns: 1fr; } }
+    .result {
+      background: #fafafa;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      white-space: pre-wrap;
+      font-family: ui-monospace, "Consolas", "Courier New", monospace;
+      font-size: 13px;
+      max-height: 320px;
+      overflow: auto;
+    }
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: #eef2f5;
+      border: 1px solid var(--border);
+    }
+    .success { color: var(--success); }
+    .warn { color: var(--warn); }
+    .error { color: var(--error); }
+    .link {
+      color: var(--accent-1);
+      cursor: pointer;
+      text-decoration: underline;
+      background: none;
+      border: 0;
+      width: auto;
+      padding: 0;
+      margin: 0;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Survey Co-Pilot • 問卷優化平台</h1>
+    <div class="pill">前端雛形</div>
+  </header>
+  <main>
+    <section class="nav">
+      <div class="nav-item" onclick="app.navigate('dashboard')">
+        <div class="num">📊</div><h3>Dashboard</h3></div>
+      <div class="nav-item" onclick="app.navigate('upload')">
+        <div class="num">📤</div><h3>上傳</h3></div>
+      <div class="nav-item" onclick="app.navigate('llm')">
+        <div class="num">🤖</div><h3>LLM 建議</h3></div>
+      </section>
+
+    <section id="view-dashboard" class="view">
+      <div class="panel">
+        <h2>系統狀態</h2>
+        <div class="row">
+          <div>
+            <div class="badge">健康檢查</div>
+            <button class="secondary" onclick="app.checkApiHealth()">檢查 /health</button>
+            <div id="healthResult" class="result">尚未檢查</div>
+          </div>
+          <div>
+            <div class="badge">目前 Session</div>
+            <button class="secondary" onclick="app.loadSessionInfo()">載入 /session/info</button>
+            <div id="sessionResult" class="result">尚未載入</div>
+          </div>
+        </div>
+        <div style="margin-top: 12px;">
+          <div class="badge">Swagger 文件</div>
+          <button class="ghost" onclick="app.openDocs()">開啟 /docs</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-upload" class="view" style="display:none;">
+      <div class="panel">
+        <h2>上傳問卷資料</h2>
+        <input id="uploadFile" type="file" accept=".csv,.xlsx" />
+        <button onclick="app.uploadFile()">上傳</button>
+        <div id="uploadResult" class="result">尚未上傳</div>
+      </div>
+    </section>
+
+    <section id="view-llm" class="view" style="display:none;">
+      <div class="panel">
+        <h2>LLM 建議</h2>
+        <div class="row">
+          <div>
+            <label>Provider</label>
+            <select id="llmProvider">
+              <option value="">local (default fallback)</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+          </div>
+          <div>
+            <label>Model</label>
+            <input id="llmModel" placeholder="例：gpt-4o / claude-sonnet-4" />
+          </div>
+        </div>
+        <input id="llmApiKey" type="password" placeholder="LLM API Key（可選）" />
+        <button onclick="app.callLlmSuggestions()">取得 /analyze/llm-suggestions</button>
+        <div id="llmResult" class="result">尚未呼叫</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const API_BASE = (window.location.origin);
+    class App {
+      constructor() {
+        this.apiKey = localStorage.getItem('sc_api_key') || '';
+        this.token = localStorage.getItem('sc_token') || '';
+      }
+      get headers() {
+        const h = {};
+        if (this.apiKey) h['x-api-key'] = this.apiKey;
+        if (this.token) h['authorization'] = 'Bearer ' + this.token;
+        return h;
+      }
+      navigate(view) {
+        document.querySelectorAll('.view').forEach(el => el.style.display = 'none');
+        document.getElementById('view-' + view).style.display = 'block';
+      }
+      openDocs() { window.open('/docs', '_blank'); }
+      async checkApiHealth() {
+        const el = document.getElementById('healthResult');
+        try {
+          const r = await fetch('/health');
+          el.textContent = JSON.stringify(await r.json(), null, 2);
+          el.className = 'result success';
+        } catch (e) {
+          el.textContent = 'error: ' + e.message; el.className = 'result error';
+        }
+      }
+      async loadSessionInfo() {
+        const el = document.getElementById('sessionResult');
+        try {
+          const r = await fetch('/session/info', { headers: this.headers });
+          el.textContent = JSON.stringify(await r.json(), null, 2);
+          el.className = 'result success';
+        } catch (e) {
+          el.textContent = 'error: ' + e.message; el.className = 'result error';
+        }
+      }
+      asyncUploadFile(file) {
+        const fd = new FormData(); fd.append('file', file);
+        const r = await fetch('/upload', { method: 'POST', headers: this.headers, body: fd });
+        return { status: r.status, data: await r.json().catch(() => ({ raw: await r.text() })) };
+      }
+      uploadFile() {
+        const file = document.getElementById('uploadFile').files[0];
+        if (!file) return;
+        this.asyncUploadFile(file).then(({ status, data }) => {
+          const el = document.getElementById('uploadResult');
+          el.textContent = 'status=' + status + '\n' + JSON.stringify(data, null, 2);
+          el.className = status < 400 ? 'result success' : 'result error';
+        });
+      }
+      async callLlmSuggestions() {
+        const el = document.getElementById('llmResult');
+        try {
+          const body = {
+            provider: document.getElementById('llmProvider').value || undefined,
+            model: document.getElementById('llmModel').value || undefined,
+            api_key: document.getElementById('llmApiKey').value || undefined,
+          };
+          const r = await fetch('/analyze/llm-suggestions', {
+            method: 'POST',
+            headers: { ...this.headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const data = await r.json();
+          el.textContent = 'status=' + r.status + '\n' + JSON.stringify(data, null, 2);
+          el.className = r.status < 400 ? 'result success' : 'result error';
+        } catch (e) {
+          el.textContent = 'error: ' + e.message; el.className = 'result error';
+        }
+      }
+    }
+    const app = new App();
+  </script>
+</body>
+</html>

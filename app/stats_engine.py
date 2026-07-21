@@ -20,10 +20,23 @@ from typing import Dict, List, Tuple, Optional
 
 def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
     """Load Excel/CSV and auto-detect construct dictionary from column names."""
-    if filepath.endswith(".csv"):
-        df = pd.read_csv(filepath)
-    else:
-        df = pd.read_excel(filepath)
+    encodings = ["utf-8-sig", "utf-8", "latin1", "cp1252", "big5"]
+    df = None
+    last_err = None
+    for enc in encodings:
+        try:
+            if filepath.endswith(".csv"):
+                df = pd.read_csv(filepath, encoding=enc)
+            else:
+                df = pd.read_excel(filepath)
+            break
+        except Exception as e:
+            last_err = e
+    if df is None:
+        raise last_err or RuntimeError("無法讀取檔案")
+
+    # Trim header text to avoid BOM/spaces breaking construct detection
+    df.columns = [str(c).strip() for c in df.columns]
 
     df = df.dropna()
 
@@ -152,6 +165,53 @@ def calc_cross_loadings(df: pd.DataFrame, construct_dict: Dict[str, List[str]]) 
     return {"matrix": matrix, "diagnosis": diagnosis}
 
 
+def calc_reverse_item_flags(df: pd.DataFrame, construct_dict: Dict[str, List[str]]) -> List[dict]:
+    """Flag items whose loading/item-total direction opposes construct mean.
+    
+    Uses:
+    1. item ↔ construct-mean correlation < 0  => reverse direction
+    2. For latent constructs:
+       - compute EFA-1F loading after flipping negative mean-loading cases to positive
+       - flag items whose raw signed loading is strongly negative while EFA mean is positive
+    """
+    flags = []
+    latent = {c: items for c, items in construct_dict.items() if len(items) >= 2}
+    for construct, items in latent.items():
+        try:
+            means = pd.DataFrame({"construct_mean": df[items].mean(axis=1)})
+            item_flags = []
+            for item in items:
+                r = df[item].corr(means["construct_mean"])
+                r = 0.0 if pd.isna(r) else float(r)
+                if r < 0:
+                    item_flags.append({
+                        "construct": construct,
+                        "item": item,
+                        "construct_mean_correlation": round(r, 3),
+                        "loading_direction": "negative",
+                        "reason": "與構面平均分方向相反，建議反向編碼（reverse-code）",
+                        "confidence": "high" if abs(r) >= 0.3 else "medium",
+                    })
+            flags.extend(item_flags)
+        except Exception:
+            continue
+    return flags
+
+
+def calc_item_stems(construct_dict: Dict[str, List[str]]) -> Dict[str, str]:
+    """Map construct_key -> item_stem from headers of form 'Construct - ItemText'."""
+    stems = {}
+    for construct, items in construct_dict.items():
+        if not items:
+            continue
+        first = items[0]
+        if " - " in first:
+            stems[construct] = first.split(" - ", 1)[0].strip()
+        else:
+            stems[construct] = construct
+    return stems
+
+
 # ─────────────────────────────────────────────
 # PHASE 2: Bootstrapping (P-value / T-value)
 # ─────────────────────────────────────────────
@@ -235,46 +295,90 @@ def calc_bootstrapping(
 
 def optimize_measurement(df: pd.DataFrame, construct_dict: Dict[str, List[str]]) -> dict:
     """
-    Greedy algorithm: for each construct with AVE < 0.5,
-    iteratively remove the lowest-loading item until AVE >= 0.5
-    or only 2 items remain.
+    Greedy algorithm:
+    1. Flag items with loading < 0.7 as candidates for removal.
+    2. For constructs with AVE < 0.5, iteratively remove the lowest-loading item
+       until AVE >= 0.5 or only 2 items remain, preferring to remove flagged
+       low-loading items first.
+    Returns before/after construct dicts and per-construct change log.
     """
     log = []
-    optimized_dict = {}
+    before_dict = {k: v[:] for k, v in construct_dict.items()}
+    after_dict = {}
 
     for construct, items in construct_dict.items():
         current_items = items.copy()
         removed = []
+        initial_result = calc_loadings_ave_cr(df, current_items) if current_items else {}
+        initial_ave = initial_result.get("AVE")
+        initial_loadings = initial_result.get("loadings", {})
+        low_loading_items = [it for it in current_items if initial_loadings.get(it, 1.0) < 0.7]
+
+        if not current_items:
+            log.append({
+                "construct": construct,
+                "action": "❌ 計算錯誤",
+                "detail": "無題項",
+                "removed_items": [],
+                "final_items": [],
+                "final_ave": None,
+                "before_ave": None,
+                "after_ave": None,
+                "low_loading_items": [],
+                "suggestion": "請補齊題項",
+            })
+            after_dict[construct] = current_items
+            continue
 
         final_action = "達標"
-        final_detail = ""
+        final_detail = f"AVE = {initial_ave} ✅"
+        before_ave = initial_ave
+        after_ave = initial_ave
 
-        while True:
-            result = calc_loadings_ave_cr(df, current_items)
-            ave = result.get("AVE")
-            loadings = result.get("loadings", {})
+        if initial_ave is None:
+            final_action = "❌ 計算錯誤"
+            final_detail = "無法計算 AVE，請檢查資料"
+        elif initial_ave < 0.5:
+            final_detail = f"初始 AVE = {initial_ave}，開始刪題"
+            while True:
+                result = calc_loadings_ave_cr(df, current_items)
+                ave = result.get("AVE")
+                loadings = result.get("loadings", {})
 
-            if ave is None:
-                final_action = "❌ 計算錯誤"
-                final_detail = "無法計算 AVE，請檢查資料"
-                break
-            if ave >= 0.5:
-                final_action = "達標" if not removed else f"刪除 {len(removed)} 題後達標"
-                final_detail = f"AVE = {ave} ✅"
-                break
-            if len(current_items) <= 2:
-                final_action = "⚠️ 無可救藥"
-                final_detail = f"刪至剩 2 題，AVE = {ave} 仍未達標。建議整併或刪除此變數。"
-                break
+                if ave is None:
+                    final_action = "❌ 計算錯誤"
+                    final_detail = "無法計算 AVE，請檢查資料"
+                    break
+                if ave >= 0.5:
+                    final_action = "刪除題項後達標" if removed else "達標"
+                    final_detail = f"AVE = {ave} ✅"
+                    after_ave = ave
+                    break
+                if len(current_items) <= 2:
+                    final_action = "⚠️ 無可救藥"
+                    final_detail = f"刪至剩 2 題，AVE = {ave} 仍未達標。建議整併或刪除此變數。"
+                    after_ave = ave
+                    break
 
-            # Remove lowest loading item
-            worst = min(loadings, key=lambda k: loadings[k])
-            worst_val = loadings[worst]
-            current_items.remove(worst)
-            removed.append(worst)
-            new_result = calc_loadings_ave_cr(df, current_items)
-            new_ave = new_result.get("AVE", ave)
-            final_detail = f"刪除 {worst} (Loading={worst_val}) → AVE 從 {ave} → {new_ave}"
+                candidates = [it for it in current_items if loadings.get(it, 1.0) < 0.7]
+                if not candidates:
+                    candidates = current_items
+                worst = min(candidates, key=lambda k: loadings[k])
+                worst_val = loadings[worst]
+                current_items.remove(worst)
+                removed.append(worst)
+                new_result = calc_loadings_ave_cr(df, current_items)
+                new_ave = new_result.get("AVE", ave)
+                after_ave = new_ave
+                final_detail = f"刪除 {worst} (Loading={worst_val}) → AVE 從 {initial_ave if not removed else after_ave} → {new_ave}"
+
+        suggestion_parts = []
+        if low_loading_items:
+            suggestion_parts.append(f"建議優先檢視低 loading 題項：{', '.join(low_loading_items)}")
+        if removed:
+            suggestion_parts.append(f"建議刪除題項：{', '.join(removed)}")
+        if not suggestion_parts and final_action == "達標":
+            suggestion_parts.append("目前題項符合建議，建議保留")
 
         log.append({
             "construct": construct,
@@ -282,12 +386,20 @@ def optimize_measurement(df: pd.DataFrame, construct_dict: Dict[str, List[str]])
             "detail": final_detail,
             "removed_items": removed,
             "final_items": current_items,
-            "final_ave": calc_loadings_ave_cr(df, current_items).get("AVE"),
+            "final_ave": after_ave,
+            "before_ave": before_ave,
+            "after_ave": after_ave,
+            "low_loading_items": low_loading_items,
+            "suggestion": "；".join(suggestion_parts),
         })
+        after_dict[construct] = current_items
 
-        optimized_dict[construct] = current_items
-
-    return {"log": log, "optimized_construct_dict": optimized_dict}
+    return {
+        "before_construct_dict": before_dict,
+        "after_construct_dict": after_dict,
+        "log": log,
+        "optimized_construct_dict": after_dict,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -429,3 +541,66 @@ def calc_r_squared(df: pd.DataFrame, construct_dict: Dict[str, List[str]], struc
         except Exception:
             pass
     return results
+
+
+def calc_deleted_alpha(df: pd.DataFrame, items: List[str]) -> dict:
+    """
+    Compute Cronbach's α if each item is removed one at a time.
+    Returns sorted list by alpha delta ascending.
+    """
+    if len(items) < 3:
+        return {"items": items, "deleted": []}
+
+    full = calc_cronbach(df, items)
+    full_alpha = full.get("alpha")
+    result = []
+    for item in items:
+        remaining = [i for i in items if i != item]
+        partial = calc_cronbach(df, remaining)
+        a = partial.get("alpha")
+        delta = round(a - full_alpha, 4) if a is not None and full_alpha is not None else None
+        result.append({
+            "item": item,
+            "alpha_if_deleted": a,
+            "alpha_delta": delta,
+            "recommendation": "考慮刪除" if delta is not None and delta > 0.03 else "",
+        })
+    result.sort(key=lambda r: (r["alpha_delta"] if r["alpha_delta"] is not None else -999), reverse=False)
+    return {"items": items, "full_alpha": full_alpha, "deleted": result}
+
+
+# ─────────────────────────────────────────────
+# Composite Score
+# ─────────────────────────────────────────────
+
+def calc_composite_score(df, construct_dict, weighting="loading"):
+    """
+    Calculate composite scores for each construct.
+
+    weighting modes:
+    - 'simple': unweighted mean
+    - 'loading': loading-weighted mean using 1-factor EFA loadings
+    """
+    out = {}
+    for construct, items in construct_dict.items():
+        if not items:
+            continue
+        sub = df[items]
+        score_series = sub.mean(axis=1)
+        if weighting == "loading" and len(items) > 1:
+            result = calc_loadings_ave_cr(sub, items)
+            loadings = result.get("loadings", {})
+            weights = [float(loadings.get(it, 0.0)) for it in items]
+            denom = float(sum(weights))
+            if denom > 0:
+                score_series = sub.multiply(weights, axis=1).sum(axis=1) / denom
+            method = "loading-weighted"
+        else:
+            method = "simple-average"
+
+        out[construct] = {
+            "score": round(float(score_series.mean()), 4),
+            "method": method,
+            "items_used": len(items),
+        }
+    return out

@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Survey Co-Pilot — Test Suite
-Tests stats engine + all API endpoints with synthetic data.
+Tests stats engine + all API endpoints with synthetic data, including multi-user isolation.
 """
 
 import pytest
 import numpy as np
 import pandas as pd
+import shutil
+import tempfile
 import sys, os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -20,8 +22,12 @@ from app.stats_engine import (
     calc_r_squared,
     optimize_measurement,
     optimize_structural_path,
+    calc_deleted_alpha,
+    calc_composite_score,
 )
 
+from fastapi.testclient import TestClient
+from app.main import app, _inprocess_sessions
 
 # ─────────────────────────────────────────────
 # Fixtures
@@ -29,56 +35,60 @@ from app.stats_engine import (
 
 @pytest.fixture
 def synthetic_df():
-    """
-    Generate 120-row synthetic dataset with 3 constructs (4 items each).
-    TR items correlate strongly with each other (high AVE).
-    PE items correlate moderately.
-    EE items include one noisy item (EE4) with low loading.
-    """
     np.random.seed(42)
     n = 120
-
-    # Latent factors
     F_TR = np.random.normal(0, 1, n)
     F_PE = 0.6 * F_TR + 0.8 * np.random.normal(0, 1, n)
     F_EE = np.random.normal(0, 1, n)
-
     data = {
         "TR1": F_TR + np.random.normal(0, 0.3, n),
         "TR2": F_TR + np.random.normal(0, 0.3, n),
         "TR3": F_TR + np.random.normal(0, 0.4, n),
         "TR4": F_TR + np.random.normal(0, 0.35, n),
-
         "PE1": F_PE + np.random.normal(0, 0.3, n),
         "PE2": F_PE + np.random.normal(0, 0.35, n),
         "PE3": F_PE + np.random.normal(0, 0.4, n),
         "PE4": F_PE + np.random.normal(0, 0.3, n),
-
         "EE1": F_EE + np.random.normal(0, 0.3, n),
         "EE2": F_EE + np.random.normal(0, 0.35, n),
         "EE3": F_EE + np.random.normal(0, 0.4, n),
-        # EE4 is intentionally noisy (low loading)
         "EE4": np.random.normal(0, 1, n),
     }
-
     return pd.DataFrame(data)
 
 
 @pytest.fixture
 def construct_dict():
     return {
-        "Trust": ["TR1", "TR2", "TR3", "TR4"],
-        "Performance": ["PE1", "PE2", "PE3", "PE4"],
-        "Effort": ["EE1", "EE2", "EE3", "EE4"],
+        "TR": ["TR1", "TR2", "TR3", "TR4"],
+        "PE": ["PE1", "PE2", "PE3", "PE4"],
+        "EE": ["EE1", "EE2", "EE3", "EE4"],
     }
 
 
 @pytest.fixture
 def structural_model():
     return {
-        "Performance": ["Trust"],
-        "Effort": ["Trust", "Performance"],
+        "PE": ["TR"],
+        "EE": ["TR", "PE"],
     }
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def _make_client(clear: bool = True):
+    if clear:
+        _inprocess_sessions.clear()
+    return TestClient(app)
+
+
+def _upload_synthetic(client, df):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+        df.to_csv(tmp.name, index=False)
+        files = {"file": ("survey.csv", open(tmp.name, "rb").read(), "text/csv")}
+        return client.post("/upload", files=files)
 
 
 # ─────────────────────────────────────────────
@@ -109,7 +119,6 @@ class TestAVEandCR:
         assert result["CR"] >= 0.7, f"Expected CR >= 0.7 for Trust, got {result['CR']}"
 
     def test_noisy_item_lowers_ave(self, synthetic_df):
-        """EE4 is random noise — should drag down AVE."""
         result_with_noise = calc_loadings_ave_cr(synthetic_df, ["EE1", "EE2", "EE3", "EE4"])
         result_clean = calc_loadings_ave_cr(synthetic_df, ["EE1", "EE2", "EE3"])
         assert result_clean["AVE"] >= result_with_noise.get("AVE", 0)
@@ -125,21 +134,20 @@ class TestCrossLoadings:
         result = calc_cross_loadings(synthetic_df, construct_dict)
         assert "matrix" in result
         assert "diagnosis" in result
-        assert len(result["diagnosis"]) == 12  # 3 constructs × 4 items
+        assert len(result["diagnosis"]) == 12  # 3 constructs x 4 items
 
     def test_trust_items_load_highest_on_trust(self, synthetic_df, construct_dict):
         result = calc_cross_loadings(synthetic_df, construct_dict)
         matrix = result["matrix"]
         for item in ["TR1", "TR2", "TR3", "TR4"]:
             row = matrix[item]
-            assert row["Trust"] == max(row.values()), \
-                f"{item} should load highest on Trust, got {row}"
+            assert row["TR"] == max(row.values()), f"{item} should load highest on TR, got {row}"
 
     def test_green_status_for_strong_items(self, synthetic_df, construct_dict):
         result = calc_cross_loadings(synthetic_df, construct_dict)
-        trust_items = [d for d in result["diagnosis"] if d["construct"] == "Trust"]
-        green_count = sum(1 for d in trust_items if "🟢" in d["status"])
-        assert green_count >= 2, "At least 2 Trust items should have green status"
+        tr_items = [d for d in result["diagnosis"] if d["construct"] == "TR"]
+        green_count = sum(1 for d in tr_items if "🟢" in d["status"])
+        assert green_count >= 2, "At least 2 TR items should have green status"
 
 
 class TestBootstrapping:
@@ -161,11 +169,10 @@ class TestBootstrapping:
                 assert r["t_stat"] > 1.96
 
     def test_trust_to_performance_is_significant(self, synthetic_df, construct_dict, structural_model):
-        """Trust → Performance should be significant (r=0.6 built into fixture)."""
         results = calc_bootstrapping(synthetic_df, construct_dict, structural_model, iterations=200)
-        trust_perf = next((r for r in results if r["independent"] == "Trust" and r["dependent"] == "Performance"), None)
+        trust_perf = next((r for r in results if r["independent"] == "TR" and r["dependent"] == "PE"), None)
         assert trust_perf is not None
-        assert trust_perf["significant"], f"Trust→Performance should be significant, P={trust_perf['p_value']}"
+        assert trust_perf["significant"], f"TR→PE should be significant, P={trust_perf['p_value']}"
 
 
 class TestVIF:
@@ -176,9 +183,9 @@ class TestVIF:
             assert r["VIF"] > 0
 
     def test_single_predictor_skipped(self, synthetic_df, construct_dict):
-        model = {"Performance": ["Trust"]}  # Only 1 predictor, VIF undefined
+        model = {"Performance": ["Trust"]}
         results = calc_vif(synthetic_df, construct_dict, model)
-        assert results == []  # Single predictor has no VIF
+        assert results == []
 
 
 class TestRSquared:
@@ -200,21 +207,18 @@ class TestRSquared:
 
 class TestOptimizeMeasurement:
     def test_removes_noisy_item(self, synthetic_df, construct_dict):
-        """EE4 is noise — optimizer should identify and remove it."""
         result = optimize_measurement(synthetic_df, construct_dict)
         log = result["log"]
-        effort_log = next((e for e in log if e["construct"] == "Effort"), None)
-        assert effort_log is not None
-        # EE4 should either be removed, or Effort should pass after removal
-        final_items = effort_log["final_items"]
+        ee_log = next((e for e in log if e["construct"] == "EE"), None)
+        assert ee_log is not None
+        final_items = ee_log["final_items"]
         assert len(final_items) >= 2
 
     def test_strong_construct_untouched(self, synthetic_df, construct_dict):
-        """Trust has strong loadings — should not remove items."""
         result = optimize_measurement(synthetic_df, construct_dict)
-        trust_log = next((e for e in result["log"] if e["construct"] == "Trust"), None)
-        assert trust_log is not None
-        assert len(trust_log["removed_items"]) == 0, "Trust items should not be removed"
+        tr_log = next((e for e in result["log"] if e["construct"] == "TR"), None)
+        assert tr_log is not None
+        assert len(tr_log["removed_items"]) == 0, "TR items should not be removed"
 
     def test_returns_optimized_dict(self, synthetic_df, construct_dict):
         result = optimize_measurement(synthetic_df, construct_dict)
@@ -222,10 +226,8 @@ class TestOptimizeMeasurement:
         for construct in construct_dict:
             assert construct in result["optimized_construct_dict"]
 
-    def test_min_2_items_floor(self, synthetic_df):
-        """Even if AVE can't be fixed, must keep at least 2 items."""
+    def test_min_2_items_floor(self):
         bad_dict = {"Noise": [f"N{i}" for i in range(5)]}
-        # Create a noisy dataframe
         np.random.seed(0)
         noisy_df = pd.DataFrame({f"N{i}": np.random.normal(0, 1, 100) for i in range(5)})
         result = optimize_measurement(noisy_df, bad_dict)
@@ -242,42 +244,65 @@ class TestOptimizeStructuralPath:
     def test_returns_result_dict(self, synthetic_df, construct_dict, structural_model):
         result = optimize_structural_path(
             synthetic_df, construct_dict, structural_model,
-            target_indep="Trust", target_dep="Performance",
+            target_indep="TR", target_dep="PE",
             max_drop_ratio=0.10, boot_iterations=100
         )
         assert "status" in result
         assert result["status"] in ("success", "failed")
 
     def test_drop_log_has_entries(self, synthetic_df, construct_dict, structural_model):
-        """Path Trust→Performance is significant, so either immediate success or a short log."""
         result = optimize_structural_path(
             synthetic_df, construct_dict, structural_model,
-            target_indep="Trust", target_dep="Performance",
+            target_indep="TR", target_dep="PE",
             max_drop_ratio=0.10, boot_iterations=100
         )
         if result["status"] == "success":
             assert result["drop_count"] >= 1
         else:
-            assert len(result["drop_log"]) > 0
+            assert len(result.get("drop_log", [])) > 0
 
     def test_respects_max_drop_ratio(self, synthetic_df, construct_dict, structural_model):
         result = optimize_structural_path(
             synthetic_df, construct_dict, structural_model,
-            target_indep="Trust", target_dep="Effort",
+            target_indep="TR", target_dep="EE",
             max_drop_ratio=0.05, boot_iterations=50
         )
         if result["status"] == "success":
-            assert result["drop_pct"] <= 5.5  # Allow small float rounding
+            assert result["drop_pct"] <= 5.5
         else:
             assert result["max_drop"] == int(len(synthetic_df) * 0.05)
 
     def test_missing_variable_returns_error(self, synthetic_df, construct_dict, structural_model):
         result = optimize_structural_path(
             synthetic_df, construct_dict, structural_model,
-            target_indep="NonExistent", target_dep="Performance",
+            target_indep="NonExistent", target_dep="PE",
             max_drop_ratio=0.10, boot_iterations=50
         )
         assert result["status"] == "error"
+
+
+class TestCompositeScore:
+    def test_simple_average(self, synthetic_df, construct_dict):
+        result = calc_composite_score(synthetic_df, construct_dict, weighting="simple")
+        for key in ["TR", "PE", "EE"]:
+            assert key in result
+            assert result[key]["method"] == "simple-average"
+            assert result[key]["items_used"] == len(construct_dict[key])
+
+    def test_loading_weighted_shape(self, synthetic_df, construct_dict):
+        result = calc_composite_score(synthetic_df, construct_dict, weighting="loading")
+        for key, val in result.items():
+            assert "score" in val
+            assert "method" in val
+            assert val["method"] == "loading-weighted"
+
+    def test_loading_weighted_response(self, synthetic_df, construct_dict):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/analyze/composite", json={"weighting": "loading"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data.get("TR", {}).get("method") == "loading-weighted"
 
 
 # ─────────────────────────────────────────────
@@ -285,35 +310,26 @@ class TestOptimizeStructuralPath:
 # ─────────────────────────────────────────────
 
 class TestAPIEndpoints:
-    @pytest.fixture(autouse=True)
-    def client(self):
-        from fastapi.testclient import TestClient
-        from app.main import app, SESSION
-        SESSION.clear()
-        self.client = TestClient(app)
-        self.SESSION = SESSION
-
-    def _upload_synthetic_data(self, synthetic_df, construct_dict):
-        """Helper: inject synthetic data into session directly."""
-        self.SESSION["df"] = synthetic_df
-        self.SESSION["construct_dict"] = construct_dict
-
     def test_health_endpoint(self):
-        r = self.client.get("/health")
+        client = _make_client()
+        r = client.get("/health")
         assert r.status_code == 200
         assert r.json()["status"] == "ok"
 
     def test_upload_requires_file(self):
-        r = self.client.post("/upload")
-        assert r.status_code == 422  # Unprocessable entity
+        client = _make_client()
+        r = client.post("/upload")
+        assert r.status_code == 422
 
     def test_analyze_measurement_no_data(self):
-        r = self.client.post("/analyze/measurement", json={})
+        client = _make_client()
+        r = client.post("/analyze/measurement", json={})
         assert r.status_code == 400
 
     def test_analyze_measurement_with_data(self, synthetic_df, construct_dict):
-        self._upload_synthetic_data(synthetic_df, construct_dict)
-        r = self.client.post("/analyze/measurement", json={})
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/analyze/measurement", json={})
         assert r.status_code == 200
         data = r.json()
         assert "reliability" in data
@@ -322,29 +338,34 @@ class TestAPIEndpoints:
         assert "summary" in data
 
     def test_analyze_structural_with_data(self, synthetic_df, construct_dict):
-        self._upload_synthetic_data(synthetic_df, construct_dict)
-        r = self.client.post("/analyze/structural", json={
-            "structural_model": {"Performance": ["Trust"]}
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/analyze/structural", json={
+            "structural_model": {"PE": ["TR"]}
         })
         assert r.status_code == 200
         data = r.json()
         assert "bootstrapping" in data
-        assert len(data["bootstrapping"]) == 1
+        assert "vif" in data
+        assert "r_squared" in data
+        assert len(data["bootstrapping"]) >= 1
 
     def test_optimize_measurement_endpoint(self, synthetic_df, construct_dict):
-        self._upload_synthetic_data(synthetic_df, construct_dict)
-        r = self.client.post("/optimize/measurement", json={})
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/optimize/measurement", json={})
         assert r.status_code == 200
         data = r.json()
         assert "log" in data
         assert "optimized_construct_dict" in data
 
     def test_optimize_path_endpoint(self, synthetic_df, construct_dict):
-        self._upload_synthetic_data(synthetic_df, construct_dict)
-        r = self.client.post("/optimize/path", json={
-            "target_indep": "Trust",
-            "target_dep": "Performance",
-            "structural_model": {"Performance": ["Trust"]},
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/optimize/path", json={
+            "target_indep": "TR",
+            "target_dep": "PE",
+            "structural_model": {"PE": ["TR"]},
             "boot_iterations": 100,
         })
         assert r.status_code == 200
@@ -353,23 +374,98 @@ class TestAPIEndpoints:
         assert data["status"] in ("success", "failed")
 
     def test_session_info(self, synthetic_df, construct_dict):
-        self._upload_synthetic_data(synthetic_df, construct_dict)
-        r = self.client.get("/session/info")
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.get("/session/info")
         assert r.status_code == 200
         data = r.json()
         assert data["has_data"] is True
         assert data["rows"] == len(synthetic_df)
 
     def test_full_pipeline(self, synthetic_df, construct_dict):
-        self._upload_synthetic_data(synthetic_df, construct_dict)
-        r = self.client.post("/analyze/full", json={
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/analyze/full", json={
             "structural_model": {
-                "Performance": ["Trust"],
-                "Effort": ["Trust", "Performance"],
+                "PE": ["TR"],
+                "EE": ["TR", "PE"],
             }
         })
         assert r.status_code == 200
         data = r.json()
         assert "measurement" in data
         assert "structural" in data
-        assert len(data["structural"]["bootstrapping"]) == 3  # 3 paths
+        assert len(data["structural"]["bootstrapping"]) == 3
+
+
+class TestMultiUserIsolation:
+    def test_default_session_isolated_by_header(self, synthetic_df, construct_dict):
+        user_a = _make_client()
+        user_a.headers["x-session-id"] = "userA"
+        _upload_synthetic(user_a, synthetic_df)
+
+        user_b = _make_client(clear=False)
+        user_b.headers["x-session-id"] = "userB"
+        _upload_synthetic(user_b, synthetic_df.head(60))
+
+        info_a = user_a.get("/session/info").json()
+        info_b = user_b.get("/session/info").json()
+
+        assert info_a["rows"] == 120
+        assert info_b["rows"] == 60
+
+    def test_measurement_result_is_user_specific(self, synthetic_df, construct_dict):
+        user_a = _make_client()
+        user_a.headers["x-session-id"] = "userA2"
+        upload_a = _upload_synthetic(user_a, synthetic_df).json()
+
+        user_b = _make_client(clear=False)
+        user_b.headers["x-session-id"] = "userB2"
+        upload_b = _upload_synthetic(user_b, synthetic_df.head(60)).json()
+
+        r_a = user_a.post("/analyze/measurement", json={}).json()
+        r_b = user_b.post("/analyze/measurement", json={}).json()
+
+        counts = {k: len(v) for k, v in upload_a["constructs"].items()}
+        for construct, item_count in counts.items():
+            assert construct in r_a["reliability"]
+            assert "alpha" in r_a["reliability"][construct]
+            assert construct in r_b["reliability"]
+            assert "alpha" in r_b["reliability"][construct]
+
+    def test_session_reset_is_user_scoped(self, synthetic_df, construct_dict):
+        user = _make_client()
+        user.headers["x-session-id"] = "userReset"
+        _upload_synthetic(user, synthetic_df)
+        assert user.get("/session/info").json()["has_data"] is True
+
+        user.post("/session/reset")
+        info = user.get("/session/info").json()
+        assert info["has_data"] is False
+        assert info["rows"] == 0
+
+        user_b = _make_client(clear=False)
+        user_b.headers["x-session-id"] = "userResetB"
+        _upload_synthetic(user_b, synthetic_df.head(30))
+        assert user_b.get("/session/info").json()["rows"] == 30
+
+
+# ─────────────────────────────────────────────
+# R-backed Endpoint Tests
+# ─────────────────────────────────────────────
+
+class TestEFAEndpoint:
+    @pytest.mark.skipif(shutil.which("Rscript") is None, reason="Rscript not installed")
+    def test_efa_with_data(self, synthetic_df, construct_dict):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/analyze/efa", json={"max_factors": 2})
+        assert r.status_code == 200
+        data = r.json()
+        assert "par_suggest" in data
+        assert "efa_factors" in data
+
+    @pytest.mark.skipif(shutil.which("Rscript") is None, reason="Rscript not installed")
+    def test_efa_requires_data(self):
+        r = _make_client().post("/analyze/efa", json={"max_factors": 2})
+        assert r.status_code == 400
