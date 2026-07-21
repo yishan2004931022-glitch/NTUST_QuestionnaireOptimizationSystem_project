@@ -1,7 +1,51 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.pytest_cache/
-*.egg-info/
 .venv/
 venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.cover
+*.py,cover
+
+# Node / frontend（若無前端可忽略）
+node_modules/
+.env.local
+.env.*.local
+
+# Docker / compose
+docker-compose.override.yml
+
+# Runtime session data (uploaded surveys, tokens, per-user state)
+data/
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# R
+.RData
+.Rhistory
+*.Rproj.user
+Rplots.pdf
+.Rcheck/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Notebooks（若之後有）
+.ipynb_checkpoints/
+
+# Hermes local config
+.hermes/
+
+# OneDrive / sync metadata
+*.sync-conflict-*
