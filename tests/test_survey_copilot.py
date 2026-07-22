@@ -22,6 +22,7 @@ from app.stats_engine import (
     calc_r_squared,
     optimize_measurement,
     optimize_structural_path,
+    optimize_unified,
     calc_deleted_alpha,
     calc_composite_score,
 )
@@ -281,6 +282,89 @@ class TestOptimizeStructuralPath:
         assert result["status"] == "error"
 
 
+class TestOptimizeUnified:
+    def test_stage_a_blocked_skips_stage_b(self):
+        # Pure-noise items can never reach AVE >= 0.5, even at the 2-item floor.
+        np.random.seed(0)
+        noisy_df = pd.DataFrame({f"N{i}": np.random.normal(0, 1, 100) for i in range(5)})
+        bad_dict = {"Noise": [f"N{i}" for i in range(5)]}
+        result = optimize_unified(noisy_df, bad_dict, {"Noise": []}, boot_iterations=50)
+        assert result["status"] == "blocked_at_stage_a"
+        assert result["stage_a"]["passed"] is False
+        assert result["stage_b"] is None
+        assert "Noise" in result["msg"]
+
+    def test_already_significant_path_is_not_searched(self, synthetic_df, construct_dict, structural_model):
+        # TR -> PE is a real, strong designed relationship (always significant on this seed).
+        result = optimize_unified(
+            synthetic_df, construct_dict, structural_model, boot_iterations=100
+        )
+        assert result["status"] == "completed"
+        assert result["stage_a"]["passed"] is True
+        pe_entry = next(e for e in result["stage_b"] if e["path"] == "TR → PE")
+        assert pe_entry["status"] == "already_significant"
+        assert pe_entry["baseline"]["significant"] is True
+        # optimize_structural_path's own output keys (drop_count etc.) must NOT appear --
+        # confirms the search was actually skipped, not run-and-coincidentally-matched.
+        assert "drop_count" not in pe_entry
+
+    def test_failed_search_produces_construct_review_suggestion(self, synthetic_df, construct_dict, structural_model):
+        # EE's true factor is independent noise -- TR -> EE has no real relationship and
+        # reliably stays non-significant (p~0.06) even after the sample-drop budget is
+        # exhausted. PE -> EE is right at the p~0.05 boundary and can occasionally get
+        # "rescued" by outlier removal despite there being no real effect -- that's not a
+        # test bug, it's the documented researcher-degrees-of-freedom risk this design is
+        # meant to surface via the EXPLORATORY framing, not hide. So we only assert on the
+        # reliably-failing path, and separately check the suggestion mechanism is
+        # self-consistent for whichever paths actually end up "failed".
+        result = optimize_unified(
+            synthetic_df, construct_dict, structural_model,
+            max_drop_ratio=0.10, boot_iterations=100,
+        )
+        ee_entries = [e for e in result["stage_b"] if e["dependent"] == "EE"]
+        assert len(ee_entries) == 2  # TR->EE and PE->EE
+
+        tr_ee = next(e for e in ee_entries if e["independent"] == "TR")
+        assert tr_ee["status"] == "failed"
+
+        suggested_paths = {s["path"] for s in result["construct_review_suggestions"]}
+        failed_paths = {e["path"] for e in ee_entries if e["status"] == "failed"}
+        assert failed_paths.issubset(suggested_paths)
+        assert "TR → EE" in suggested_paths
+        # Construct deletion must never be automatic -- only ever a suggestion string.
+        for s in result["construct_review_suggestions"]:
+            assert "系統不會自動執行" in s["suggestion"]
+
+    def test_stage_b_search_finds_significance(self):
+        # A weak-but-real effect suppressed by a handful of extreme outliers: not
+        # significant on the full sample, but Cook's-Distance removal within the
+        # drop budget should restore significance.
+        np.random.seed(11)
+        n = 100
+        F_A = np.random.normal(0, 1, n)
+        F_B = 0.30 * F_A + 1.0 * np.random.normal(0, 1, n)
+        data = {
+            "A1": F_A + np.random.normal(0, 0.3, n), "A2": F_A + np.random.normal(0, 0.3, n), "A3": F_A + np.random.normal(0, 0.3, n),
+            "B1": F_B + np.random.normal(0, 0.3, n), "B2": F_B + np.random.normal(0, 0.3, n), "B3": F_B + np.random.normal(0, 0.3, n),
+        }
+        for i in [2, 5, 9]:
+            data["B1"][i] += 14
+            data["B2"][i] -= 13
+            data["B3"][i] += 15
+        df = pd.DataFrame(data)
+        cd = {"A": ["A1", "A2", "A3"], "B": ["B1", "B2", "B3"]}
+        sm = {"B": ["A"]}
+
+        result = optimize_unified(df, cd, sm, max_drop_ratio=0.10, boot_iterations=150)
+        assert result["status"] == "completed"
+        entry = result["stage_b"][0]
+        assert entry["baseline"]["significant"] is False
+        assert entry["status"] == "success"
+        assert entry["final_p"] < 0.05
+        assert entry["drop_pct"] <= 10.5
+        assert result["construct_review_suggestions"] == []
+
+
 class TestCompositeScore:
     def test_simple_average(self, synthetic_df, construct_dict):
         result = calc_composite_score(synthetic_df, construct_dict, weighting="simple")
@@ -372,6 +456,31 @@ class TestAPIEndpoints:
         data = r.json()
         assert "status" in data
         assert data["status"] in ("success", "failed")
+
+    def test_optimize_full_search_endpoint(self, synthetic_df, construct_dict, structural_model):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/optimize/full-search", json={
+            "structural_model": structural_model,
+            "boot_iterations": 100,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["success"] is True
+        assert data["status"] == "completed"
+        assert data["stage_a"]["passed"] is True
+        assert len(data["stage_b"]) == 3  # TR->PE, TR->EE, PE->EE
+
+    def test_optimize_full_search_requires_structural_model(self, synthetic_df, construct_dict):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/optimize/full-search", json={"structural_model": {}})
+        assert r.status_code == 400
+
+    def test_optimize_full_search_requires_data(self):
+        client = _make_client()
+        r = client.post("/optimize/full-search", json={"structural_model": {"PE": ["TR"]}})
+        assert r.status_code == 400
 
     def test_session_info(self, synthetic_df, construct_dict):
         client = _make_client()

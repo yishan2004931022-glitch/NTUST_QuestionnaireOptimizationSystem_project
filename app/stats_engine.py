@@ -483,6 +483,101 @@ def optimize_structural_path(
 
 
 # ─────────────────────────────────────────────
+# OPTIMIZATION ENGINE — UNIFIED (Stage A → Stage B gate)
+# See ARCHITECTURE.md 第六節 for the design rationale: measurement-model
+# validity must fully pass before any structural-significance search runs,
+# and each non-significant path is searched independently (never combined —
+# jointly optimizing multiple paths compounds researcher-degrees-of-freedom
+# risk and is deliberately out of scope, see ARCHITECTURE.md 第六節末段).
+# Construct deletion/merging is never automatic — only ever surfaced as a
+# human-reviewed suggestion after Stage B exhausts its sample-drop budget.
+# ─────────────────────────────────────────────
+
+def optimize_unified(
+    df: pd.DataFrame,
+    construct_dict: Dict[str, List[str]],
+    structural_model: Dict[str, List[str]],
+    max_drop_ratio: float = 0.10,
+    boot_iterations: int = 300,
+) -> dict:
+    """
+    Stage A: run optimize_measurement() as a hard gate. If any construct
+    can't reach AVE >= 0.5 within the greedy item-deletion budget, stop —
+    structural significance search is meaningless on a measurement model
+    that hasn't been validated.
+
+    Stage B (only if Stage A fully passes): for every structural path that
+    is not yet significant on the Stage-A-cleaned data, run
+    optimize_structural_path() independently. Paths already significant are
+    reported as-is, not re-searched. Paths that remain non-significant even
+    after the max sample-drop budget produce a human-reviewed suggestion to
+    consider construct-level changes -- never an automatic deletion.
+    """
+    stage_a = optimize_measurement(df, construct_dict)
+    stage_a_passed = all(entry["action"] != "⚠️ 無可救藥" and entry["action"] != "❌ 計算錯誤" for entry in stage_a["log"])
+    optimized_construct_dict = stage_a["optimized_construct_dict"]
+
+    result = {
+        "stage_a": {
+            "passed": stage_a_passed,
+            "log": stage_a["log"],
+            "optimized_construct_dict": optimized_construct_dict,
+        },
+        "stage_b": None,
+        "construct_review_suggestions": [],
+    }
+
+    if not stage_a_passed:
+        blocked_constructs = [e["construct"] for e in stage_a["log"] if e["action"] in ("⚠️ 無可救藥", "❌ 計算錯誤")]
+        result["status"] = "blocked_at_stage_a"
+        result["msg"] = (
+            f"🔴 測量模型未通過，Stage B 結構顯著性搜尋不會執行。"
+            f"未達標構面：{', '.join(blocked_constructs)}。"
+            f"請先處理這些構面（增加/更換題項，或考慮整併，需要文獻支持）再重新執行。"
+        )
+        return result
+
+    baseline_paths = calc_bootstrapping(df, optimized_construct_dict, structural_model, iterations=boot_iterations)
+
+    stage_b_results = []
+    for path in baseline_paths:
+        entry = {
+            "path": path["path"],
+            "independent": path["independent"],
+            "dependent": path["dependent"],
+            "baseline": path,
+        }
+        if path["significant"]:
+            entry["status"] = "already_significant"
+            entry["msg"] = f"🟢 {path['path']} 在原始資料上已顯著（P={path['p_value']}），不需要搜尋。"
+        else:
+            search = optimize_structural_path(
+                df=df,
+                construct_dict=optimized_construct_dict,
+                structural_model=structural_model,
+                target_indep=path["independent"],
+                target_dep=path["dependent"],
+                max_drop_ratio=max_drop_ratio,
+                boot_iterations=boot_iterations,
+            )
+            entry.update(search)
+            if search.get("status") == "failed":
+                result["construct_review_suggestions"].append({
+                    "path": path["path"],
+                    "suggestion": (
+                        f"{path['path']} 在刪除上限 {int(max_drop_ratio*100)}% 樣本內仍未顯著。"
+                        f"可考慮：(1) 檢視是否有中介變數 (2) 檢視構面定義是否需要調整或整併"
+                        f"（需要文獻支持，系統不會自動執行）(3) 重新檢視理論架構。"
+                    ),
+                })
+        stage_b_results.append(entry)
+
+    result["stage_b"] = stage_b_results
+    result["status"] = "completed"
+    return result
+
+
+# ─────────────────────────────────────────────
 # VIF (Variance Inflation Factor)
 # ─────────────────────────────────────────────
 
