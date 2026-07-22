@@ -18,6 +18,7 @@ import tempfile
 from fastapi.testclient import TestClient
 from app.main import app, _inprocess_sessions
 from app.session_store import save_session, load_session, clear_session
+from app import db as audit_db
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +26,13 @@ def session_clean():
     _inprocess_sessions.clear()
     yield
     _inprocess_sessions.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolated_audit_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(audit_db, "DB_PATH", str(tmp_path / "test_audit.db"))
+    audit_db.init_db()
+    yield
 
 # R availability: prefer PATH, fall back to default install location.
 try:
@@ -190,3 +198,22 @@ class TestSeminrEndpoint:
         _inject_session(synthetic_df, construct_dict)
         r = _make_client().post("/analyze/seminr", json={})
         assert r.status_code == 400
+
+    @pytest.mark.skipif(r_not_available, reason="Rscript not installed locally")
+    def test_seminr_blocked_by_l2_gate_on_noise_construct(self, synthetic_df):
+        np.random.seed(1)
+        n = len(synthetic_df)
+        noisy_df = synthetic_df.copy()
+        noisy_df["N1"] = np.random.normal(0, 1, n)
+        noisy_df["N2"] = np.random.normal(0, 1, n)
+        noisy_df["N3"] = np.random.normal(0, 1, n)
+        cd = {"Trust": ["TR1", "TR2", "TR3", "TR4"], "Noise": ["N1", "N2", "N3"]}
+        _inject_session(noisy_df, cd)
+        client = TestClient(app)
+        r = client.post("/analyze/seminr", json={
+            "measurement": cd,
+            "structural": {"Noise": ["Trust"]},
+            "bootstrap": 50,
+        })
+        assert r.status_code == 403
+        assert "Noise" in r.json()["detail"]

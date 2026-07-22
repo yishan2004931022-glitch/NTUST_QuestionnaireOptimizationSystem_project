@@ -534,6 +534,113 @@ class TestCompositeScore:
         data = r.json()
         assert data.get("TR", {}).get("method") == "loading-weighted"
 
+    def test_pls_weighting_requires_structural_model(self, synthetic_df, construct_dict):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/analyze/composite", json={"weighting": "pls"})
+        assert r.status_code == 400
+
+    @pytest.mark.skipif(shutil.which("Rscript") is None, reason="Rscript not installed")
+    def test_pls_weighting_uses_real_seminr_scores(self, synthetic_df, construct_dict, structural_model):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/analyze/composite", json={
+            "weighting": "pls",
+            "structural_model": structural_model,
+            "bootstrap": 30,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        for key in ["TR", "PE", "EE"]:
+            assert data[key]["method"] == "pls-weighted"
+            assert data[key]["scale"] == "standardized"
+            # estimate_pls() standardizes internally -- mean should sit near
+            # 0, unlike the raw-Likert-scale 'loading'/'simple' scores.
+            assert abs(data[key]["score"]) < 0.5
+
+
+class TestL2Gate:
+    """
+    ARCHITECTURE.md L2: structural-model endpoints must refuse to run
+    against a measurement model that hasn't passed AVE >= 0.5, unless a
+    human explicitly overrides with a logged reason.
+    """
+
+    def _bad_and_good_df(self):
+        np.random.seed(0)
+        n = 100
+        F = np.random.normal(0, 1, n)
+        data = {
+            "G1": F + np.random.normal(0, 0.3, n),
+            "G2": F + np.random.normal(0, 0.3, n),
+            "G3": F + np.random.normal(0, 0.3, n),
+            "N1": np.random.normal(0, 1, n),  # independent noise -- can never reach AVE >= 0.5
+            "N2": np.random.normal(0, 1, n),
+            "N3": np.random.normal(0, 1, n),
+        }
+        return pd.DataFrame(data)
+
+    def test_analyze_structural_blocked_when_l2_fails(self):
+        df = self._bad_and_good_df()
+        client = _make_client()
+        _upload_synthetic(client, df)
+        r = client.post("/analyze/structural", json={
+            "structural_model": {"G": ["N"]},
+            "construct_dict": {"G": ["G1", "G2", "G3"], "N": ["N1", "N2", "N3"]},
+        })
+        assert r.status_code == 403
+        assert "N" in r.json()["detail"]
+
+    def test_analyze_structural_passes_with_clean_construct_dict(self):
+        df = self._bad_and_good_df()
+        client = _make_client()
+        _upload_synthetic(client, df)
+        r = client.post("/analyze/structural", json={
+            "structural_model": {"G": []},
+            "construct_dict": {"G": ["G1", "G2", "G3"]},
+        })
+        assert r.status_code == 200
+
+    def test_override_without_reason_rejected(self):
+        df = self._bad_and_good_df()
+        client = _make_client()
+        _upload_synthetic(client, df)
+        r = client.post("/analyze/structural", json={
+            "structural_model": {"G": ["N"]},
+            "construct_dict": {"G": ["G1", "G2", "G3"], "N": ["N1", "N2", "N3"]},
+            "override_l2_gate": True,
+        })
+        assert r.status_code == 400
+
+    def test_override_with_reason_succeeds_and_is_audited(self):
+        df = self._bad_and_good_df()
+        client = _make_client()
+        _upload_synthetic(client, df)
+        r = client.post("/analyze/structural", json={
+            "structural_model": {"G": ["N"]},
+            "construct_dict": {"G": ["G1", "G2", "G3"], "N": ["N1", "N2", "N3"]},
+            "override_l2_gate": True,
+            "override_reason": "control variables, not expected to be a valid latent construct",
+        })
+        assert r.status_code == 200
+
+        history = client.get("/audit/history").json()["entries"]
+        override_entry = next(e for e in history if e["action"] == "analyze_structural_l2_override")
+        assert override_entry["is_exploratory"] is True
+        assert "N" in override_entry["request_params"]["blocked_constructs"]
+
+    def test_optimize_path_also_gated(self):
+        df = self._bad_and_good_df()
+        client = _make_client()
+        _upload_synthetic(client, df)
+        r = client.post("/optimize/path", json={
+            "target_indep": "N", "target_dep": "G",
+            "structural_model": {"G": ["N"]},
+            "construct_dict": {"G": ["G1", "G2", "G3"], "N": ["N1", "N2", "N3"]},
+            "boot_iterations": 50,
+        })
+        assert r.status_code == 403
+
 
 # ─────────────────────────────────────────────
 # API Endpoint Tests

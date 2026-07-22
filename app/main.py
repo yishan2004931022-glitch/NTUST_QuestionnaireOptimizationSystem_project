@@ -256,6 +256,8 @@ class StructuralModelInput(BaseModel):
     structural_model: Dict[str, List[str]]
     construct_dict: Optional[Dict[str, List[str]]] = None
     boot_iterations: Optional[int] = 500
+    override_l2_gate: Optional[bool] = False
+    override_reason: Optional[str] = None
 
 
 class OptimizePathInput(BaseModel):
@@ -265,6 +267,8 @@ class OptimizePathInput(BaseModel):
     construct_dict: Optional[Dict[str, List[str]]] = None
     max_drop_ratio: Optional[float] = 0.10
     boot_iterations: Optional[int] = 300
+    override_l2_gate: Optional[bool] = False
+    override_reason: Optional[str] = None
 
 
 class OptimizeMeasurementInput(BaseModel):
@@ -299,6 +303,8 @@ class SeminrInput(BaseModel):
     measurement: Optional[Dict[str, List[str]]] = None
     structural: Optional[Dict[str, List[str]]] = None
     bootstrap: Optional[int] = 200
+    override_l2_gate: Optional[bool] = False
+    override_reason: Optional[str] = None
 
 
 class LLMInput(BaseModel):
@@ -337,6 +343,8 @@ class SessionSwitchInput(BaseModel):
 class CompositeInput(BaseModel):
     construct_dict: Optional[Dict[str, List[str]]] = None
     weighting: Optional[str] = "loading"
+    structural_model: Optional[Dict[str, List[str]]] = None
+    bootstrap: Optional[int] = 100
 
 
 # ─── Upload ──────────────────────────────────────────────────────
@@ -750,6 +758,44 @@ async def analyze_llm_suggestions(request: Request, body: LLMInput):
 
 
 
+# ─── L2 hard gate ─────────────────────────────────────────────────
+# ARCHITECTURE.md L2: "L3 必須等 L2 全數通過才能執行" -- structural-model
+# endpoints must not run against a measurement model that hasn't been
+# validated, unless a human explicitly overrides with a logged reason.
+
+def _check_l2_gate(df, construct_dict: Dict[str, List[str]]):
+    result = optimize_measurement(df, construct_dict)
+    blocked = [e["construct"] for e in result["log"] if e["action"] in ("⚠️ 無可救藥", "❌ 計算錯誤")]
+    return len(blocked) == 0, blocked
+
+
+def _enforce_l2_gate(
+    df, construct_dict: Dict[str, List[str]],
+    override: bool, override_reason: Optional[str],
+    request: Request, session: Dict, action: str,
+) -> None:
+    passed, blocked = _check_l2_gate(df, construct_dict)
+    if passed:
+        return
+    if override:
+        if not override_reason or not override_reason.strip():
+            raise HTTPException(status_code=400, detail="要 override L2 關卡必須提供 override_reason（明確登記理由）")
+        audit_db.log_action(
+            _resolve_user_id(request), f"{action}_l2_override",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"blocked_constructs": blocked, "override_reason": override_reason},
+            is_exploratory=True,
+        )
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"測量模型未通過 L2 關卡（未達標構面：{', '.join(blocked)}），{action} 被擋下。"
+            f"請先用 /optimize/measurement 處理這些構面，或帶 override_l2_gate=true 與 override_reason 明確登記理由後強制執行。"
+        ),
+    )
+
+
 @app.post("/analyze/structural")
 async def analyze_structural(request: Request, body: StructuralModelInput):
     session = _get_user_session(request)
@@ -758,6 +804,7 @@ async def analyze_structural(request: Request, body: StructuralModelInput):
         raise HTTPException(status_code=400, detail="請先上傳資料檔案")
 
     construct_dict = body.construct_dict or session.get("construct_dict", {})
+    _enforce_l2_gate(df, construct_dict, body.override_l2_gate, body.override_reason, request, session, "analyze_structural")
 
     try:
         bootstrapping = calc_bootstrapping(df, construct_dict, body.structural_model, body.boot_iterations)
@@ -831,6 +878,7 @@ async def optimize_path_endpoint(request: Request, body: OptimizePathInput):
         raise HTTPException(status_code=400, detail="請先上傳資料檔案")
 
     construct_dict = body.construct_dict or session.get("optimized_construct_dict") or session.get("construct_dict", {})
+    _enforce_l2_gate(df, construct_dict, body.override_l2_gate, body.override_reason, request, session, "optimize_path")
 
     try:
         result = optimize_structural_path(
@@ -1041,11 +1089,12 @@ async def analyze_deleted_alpha(request: Request, body: DeletedAlphaInput):
 
 @app.post("/analyze/seminr")
 async def analyze_seminr(request: Request, body: SeminrInput):
-    df = _get_user_session(request).get("df")
+    session = _get_user_session(request)
+    df = session.get("df")
     if df is None:
         raise HTTPException(status_code=400, detail="請先上傳資料檔案")
 
-    measurement = body.measurement or _get_user_session(request).get("construct_dict", {})
+    measurement = body.measurement or session.get("construct_dict", {})
     structural = body.structural or {}
 
     if not measurement or not structural:
@@ -1055,6 +1104,8 @@ async def analyze_seminr(request: Request, body: SeminrInput):
     missing = [x for x in all_items if x not in df.columns]
     if missing:
         raise HTTPException(status_code=400, detail=f"資料檔找不到題項：{missing}")
+
+    _enforce_l2_gate(df, measurement, body.override_l2_gate, body.override_reason, request, session, "analyze_seminr")
 
     try:
         result = run_seminr(
@@ -1080,8 +1131,31 @@ async def analyze_composite(request: Request, body: CompositeInput):
     if not construct_dict:
         raise HTTPException(status_code=400, detail="請提供 construct_dict")
 
+    weighting = body.weighting or "loading"
+
+    if weighting == "pls":
+        # Real PLS outer weights require the full model (measurement +
+        # structural) -- the algorithm is iterative between both, it's not
+        # something that can be derived from the measurement model alone.
+        if not body.structural_model:
+            raise HTTPException(status_code=400, detail="weighting='pls' 需要提供 structural_model，PLS 權重是由完整模型（含結構模型）迭代算出的，不能只用測量模型算")
+        try:
+            seminr_result = run_seminr(df, measurement=construct_dict, structural=body.structural_model, bootstrap=body.bootstrap or 100)
+        except RBridgeError as e:
+            raise HTTPException(status_code=500, detail=f"PLS composite score 計算失敗：{e}")
+        scores = seminr_result.get("composite_scores", {})
+        return {
+            construct: {
+                "score": round(sum(vals) / len(vals), 4) if vals else None,
+                "method": "pls-weighted",
+                "scale": "standardized",  # estimate_pls() standardizes internally -- this is mean~0 by construction, not comparable in magnitude to 'loading'/'simple' scores which stay on the original Likert scale
+                "items_used": len(construct_dict.get(construct, [])),
+            }
+            for construct, vals in scores.items()
+        }
+
     try:
-        return calc_composite_score(df, construct_dict, weighting=body.weighting or "loading")
+        return calc_composite_score(df, construct_dict, weighting=weighting)
     except Exception:
         raise HTTPException(status_code=500, detail="Composite Score 計算失敗")
 
