@@ -17,6 +17,7 @@
 7. [參考文獻](#七參考文獻)
 8. [範疇確認與技術棧決策（2026-07-20 更新）](#八範疇確認與技術棧決策2026-07-20-更新)
 9. [Phase 1 統計框架完成紀錄（2026-07-22 更新）](#九phase-1-統計框架完成紀錄2026-07-22-更新)
+10. [Phase 0-4 收尾：已知缺口清理（2026-07-22 更新）](#十phase-0-4-收尾已知缺口清理2026-07-22-更新)
 
 ---
 
@@ -116,12 +117,12 @@ Simmons, Nelson & Simonsohn (2011) 證明：不揭露的研究者自由度（要
 - **這一層只診斷、標記原因，不執行刪除**——`/analyze/data-quality` 是純診斷端點，回傳每筆樣本觸發了哪些訊號，刪不刪是下面 L4 或研究者的決定。
 - **跟 L4 的強制掛勾**：`optimize_structural_path()` 新增 `allowed_drop_indices` 參數，`optimize_unified()` 預設（`require_data_quality_flag=True`）會先跑這層診斷，把結果限制傳進去——Stage B **現在只能刪除同時符合「Cook's Distance 高」跟「至少兩個 L1 訊號亮起」的樣本**，不能再單憑統計數字說了算。真實測試中驗證過：同一組刻意做出來的離群值，如果不符合 L1 標記，Stage B 會直接回報搜尋失敗（`max_drop: 0`），即使把關掉這個限制（`require_data_quality_flag=False`）它其實找得到能製造顯著性的刪法——這正是這一層存在的意義。
 
-### L2 · 測量模型層 — ✅ 統計面已補齊（見第九節）
+### L2 · 測量模型層 — ✅ 統計面 + 硬性關卡都已完成（2026-07-22）
 
-信度（α、CR）、收斂效度（Loading、AVE）、區辨效度——以 **HTMT** 為主要判準（比 Fornell-Larcker 更敏感）。**硬性關卡**：L3 必須等 L2 全數通過才能執行（這條關卡本身還沒程式碼強制，見下方 L4）。
+信度（α、CR）、收斂效度（Loading、AVE）、區辨效度——以 **HTMT** 為主要判準（比 Fornell-Larcker 更敏感）。**硬性關卡**：L3 必須等 L2 全數通過才能執行。
 
 - 沿用貪婪刪題項邏輯，但輸出是一個新版本的「純化後模型」，原始上傳資料永遠不被覆寫。
-- 程式碼層面直接擋：L3 的端點會檢查目前模型版本是否已通過 L2，沒過就回錯誤，除非有明確登記理由的人工 override——**這條關卡尚未實作**，目前 `/analyze/structural` 跟 `/analyze/seminr` 都可以在沒過 L2 的情況下直接呼叫。
+- ~~程式碼層面直接擋...這條關卡尚未實作~~ 已解決：`_enforce_l2_gate()`（`app/main.py`）掛在 `/analyze/structural`、`/analyze/seminr`、`/optimize/path` 三個端點上，沒過 L2 直接回 403，附上未達標構面名單。要繞過必須帶 `override_l2_gate=true` **且**提供 `override_reason`（沒填理由回 400），override 的動作跟理由會被寫進 L5 審計紀錄（`{action}_l2_override`，固定標記 `is_exploratory: true`）——符合原設計「除非有明確登記理由的人工 override」的字面要求，不是靠使用者自律。
 - ~~缺 HTMT、缺完整 EFA~~ 已解決：`/analyze/efa`（`r/efa_wrapper.R`，全題項多因子 EFA + Parallel Analysis）+ `/analyze/seminr`（`r/seminr_wrapper.R`，內含 HTMT）+ `/analyze/deleted-alpha`。詳見第九節。
 
 ### L3 · 結構模型層 — ✅ 大部分完成，SRMR 刻意暫緩（見第九節）
@@ -297,7 +298,7 @@ R / plumber（純統計運算服務，不處理對話、不對外公開）
 
 - ~~完整多因子 EFA + Parallel Analysis（R `psych`）~~ ✅ 已完成，見第九節
 - ~~Deleted Alpha~~ ✅ 已完成，`calc_deleted_alpha` / `/analyze/deleted-alpha`
-- Composite Score 從簡單平均升級為 `seminr` 的正統 PLS 加權組合分數——🟡 部分完成：`calc_composite_score(weighting="loading")` 現在用 Python 自己單因子 EFA 的 loading 加權，比簡單平均進步，但仍不是呼叫 `seminr` 算出的真正 PLS outer weight（`results$composite_scores`，R 端已確認可以拿到，只是還沒接進 Python 這邊）——留給下次處理
+- ~~Composite Score 從簡單平均升級為 `seminr` 的正統 PLS 加權組合分數~~ ✅ 已完成（2026-07-22）：`POST /analyze/composite` 新增 `weighting="pls"` 模式，需要額外提供 `structural_model`（PLS 權重是由測量模型+結構模型一起迭代算出的，不能只靠測量模型），呼叫 `run_seminr()` 取 `composite_scores`（`r/seminr_wrapper.R` 也同步加上這個輸出）。**注意跟原本 `"loading"`/`"simple"` 模式的量尺不同**：`estimate_pls()` 內部會先標準化資料，`"pls"` 模式回傳的分數均值會落在 0 附近，不是原始 1-5 量表的分數，回應裡明確標了 `"scale": "standardized"` 避免誤讀。`"loading"` 模式（Python 單因子 EFA 加權）保留作為不需要跑 R、不需要結構模型時的輕量替代方案。
 
 ---
 
@@ -345,3 +346,25 @@ R / plumber（純統計運算服務，不處理對話、不對外公開）
 ### 9.5 測試強化
 
 `tests/test_r_endpoints.py::TestSeminrEndpoint::test_seminr_endpoint` 從單一鬆散斷言改成逐項檢查：AVE/CR 落在 0~1、HTMT 落在合理範圍、p-value 與 t-stat 邏輯一致（t > 2.6 時 p < 0.05）、R² 落在 0~1、predictive 欄位只涵蓋內生構面題項且 RMSE > 0。50/50 全域測試（含這批）在乾淨環境下通過。
+
+---
+
+## 十、Phase 0-4 收尾：已知缺口清理（2026-07-22 更新）
+
+Phase 0-4 全部完成後，盤點當時留下的四個已知小缺口，逐一處理：
+
+### 10.1 L2 硬性關卡 — ✅ 已補上
+
+見第三節 L2。`/analyze/structural`、`/analyze/seminr`、`/optimize/path` 三個端點現在都會先跑 `_enforce_l2_gate()`，測量模型沒過 L2 就回 403，要繞過必須帶明確理由，且理由會進 L5 審計紀錄。`/optimize/full-search`（`optimize_unified()`）原本就有 Stage A 內建關卡，不受影響。
+
+### 10.2 Composite Score 真實 PLS 權重 — ✅ 已補上
+
+見第八節 8.4。`/analyze/composite` 新增 `weighting="pls"`，呼叫 `run_seminr()` 拿真正的 PLS 迭代權重，需要額外的 `structural_model` 參數，回傳標準化量尺（跟原本兩個模式的原始量尺不同，已在回應中標註）。
+
+### 10.3 SRMR — 重新評估後維持留白（決策不變，理由更新）
+
+這次重新評估的問題是「SRMR 到底重不重要」，答案是：**不是必要指標**。PLS-SEM 本來就沒有 CB-SEM 那套「配適度指標幾乎強制要報告」的傳統，SRMR 是 Henseler et al. (2014) 才借用過來的近似指標，連 Hair et al. 教科書都提醒要謹慎使用、門檻沒有嚴謹驗證過。真正 PLS-SEM 論文幾乎必備的信度/效度/解釋力/預測力指標（α、CR、AVE、HTMT、R²、f²、VIF、Q²predict）系統都已經有了。**結論：不做，不是技術做不到，是這個指標本身在 PLS-SEM 裡的必要性不足以承擔「沒驗證過的公式」這個風險。**
+
+### 10.4 R subprocess-per-call 效能 — 重新評估後維持現狀（刻意不做）
+
+這個問題被重新定性為：**它不是一個「小」缺口**，是把 R 從「每次呼叫重啟直譯器」換成「常駐服務」的整個架構搬遷，工程量跟 Phase 2-4 一個量級，而且目前**沒有任何實際變慢的證據**——優化迴圈（`optimize_unified`）目前的呼叫頻率還沒真的把 R 啟動成本放大成使用者能感知的延遲。刻意不做投機性優化；等真的量到效能瓶頸（例如優化迴圈接上更大資料量、更多輪迭代）再回頭處理，屆時第八節 8.3 的「換成常駐 plumber 服務」評估依然有效。

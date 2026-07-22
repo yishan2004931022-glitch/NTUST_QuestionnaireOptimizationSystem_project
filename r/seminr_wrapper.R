@@ -59,6 +59,7 @@ out <- list(
   r_squared = list(),
   vif = list(),
   predictive = list(),
+  composite_scores = list(),
   error = NULL
 )
 
@@ -94,6 +95,17 @@ tryCatch({
   boot_results <- bootstrap_model(results, nboot = boot_iterations, seed = 123)
   s <- summary(results)
   boot_s <- summary(boot_results)
+
+  # Real PLS-weighted composite scores (one value per respondent per
+  # construct) -- these are the actual iterative-algorithm outer weights,
+  # not an approximation. Used by /analyze/composite when a structural
+  # model is supplied.
+  cs <- results$construct_scores
+  if (!is.null(cs)) {
+    for (nm in colnames(cs)) {
+      out$composite_scores[[nm]] <- round(as.numeric(cs[, nm]), 4)
+    }
+  }
 
   # Loadings
   loadings_df <- s$loadings
