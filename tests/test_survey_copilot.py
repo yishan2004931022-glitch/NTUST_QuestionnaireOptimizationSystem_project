@@ -23,6 +23,7 @@ from app.stats_engine import (
     optimize_measurement,
     optimize_structural_path,
     optimize_unified,
+    detect_careless_responses,
     calc_deleted_alpha,
     calc_composite_score,
 )
@@ -335,10 +336,110 @@ class TestOptimizeUnified:
         for s in result["construct_review_suggestions"]:
             assert "系統不會自動執行" in s["suggestion"]
 
-    def test_stage_b_search_finds_significance(self):
+    def test_stage_b_search_finds_significance_with_l1_disabled(self):
         # A weak-but-real effect suppressed by a handful of extreme outliers: not
         # significant on the full sample, but Cook's-Distance removal within the
-        # drop budget should restore significance.
+        # drop budget should restore significance. This exercises the raw search
+        # mechanism with the L1 gate explicitly turned off -- the "was this ever
+        # a legitimate justification to drop these points" question is covered
+        # separately by TestDataQualityGate below.
+        np.random.seed(11)
+        n = 100
+        F_A = np.random.normal(0, 1, n)
+        F_B = 0.30 * F_A + 1.0 * np.random.normal(0, 1, n)
+        data = {
+            "A1": F_A + np.random.normal(0, 0.3, n), "A2": F_A + np.random.normal(0, 0.3, n), "A3": F_A + np.random.normal(0, 0.3, n),
+            "B1": F_B + np.random.normal(0, 0.3, n), "B2": F_B + np.random.normal(0, 0.3, n), "B3": F_B + np.random.normal(0, 0.3, n),
+        }
+        for i in [2, 5, 9]:
+            data["B1"][i] += 14
+            data["B2"][i] -= 13
+            data["B3"][i] += 15
+        df = pd.DataFrame(data)
+        cd = {"A": ["A1", "A2", "A3"], "B": ["B1", "B2", "B3"]}
+        sm = {"B": ["A"]}
+
+        result = optimize_unified(df, cd, sm, max_drop_ratio=0.10, boot_iterations=150, require_data_quality_flag=False)
+        assert result["status"] == "completed"
+        assert result["data_quality"] is None
+        entry = result["stage_b"][0]
+        assert entry["baseline"]["significant"] is False
+        assert entry["status"] == "success"
+        assert entry["final_p"] < 0.05
+        assert entry["drop_pct"] <= 10.5
+        assert result["construct_review_suggestions"] == []
+
+
+class TestDetectCarelessResponses:
+    def _mixed_df(self):
+        np.random.seed(3)
+        n = 60
+        F = np.random.normal(0, 1, n)
+        df = pd.DataFrame({
+            "C1": F + np.random.normal(0, 0.3, n),
+            "C2": F + np.random.normal(0, 0.3, n),
+            "C3": F + np.random.normal(0, 0.3, n),
+            "C4": F + np.random.normal(0, 0.3, n),
+        })
+        # Row 0: normal respondent. Row 1: straight-line (same value all items).
+        df.loc[1, ["C1", "C2", "C3", "C4"]] = 3.0
+        return df
+
+    def test_normal_respondent_not_flagged(self):
+        df = self._mixed_df()
+        cd = {"C": ["C1", "C2", "C3", "C4"]}
+        result = detect_careless_responses(df, cd)
+        row0 = next(r for r in result["respondents"] if r["index"] == 0)
+        assert row0["recommend_review"] is False
+
+    def test_straight_line_respondent_flagged(self):
+        df = self._mixed_df()
+        cd = {"C": ["C1", "C2", "C3", "C4"]}
+        result = detect_careless_responses(df, cd)
+        row1 = next(r for r in result["respondents"] if r["index"] == 1)
+        assert "low_irv" in row1["signals_triggered"]
+        assert "long_string" in row1["signals_triggered"]
+        assert row1["recommend_review"] is True
+        assert 1 in result["flagged_indices"]
+
+    def test_single_signal_alone_is_not_enough(self):
+        # min_signals=2 is the whole point -- one triggered signal must not
+        # be sufficient on its own (Curran, 2016).
+        df = self._mixed_df()
+        cd = {"C": ["C1", "C2", "C3", "C4"]}
+        result = detect_careless_responses(df, cd, min_signals=5)  # impossible to reach
+        assert result["flagged_count"] == 0
+        for r in result["respondents"]:
+            if r["signal_count"] > 0:
+                assert r["recommend_review"] is False
+
+    def test_response_time_signal_only_used_when_column_given(self):
+        df = self._mixed_df()
+        cd = {"C": ["C1", "C2", "C3", "C4"]}
+        without_time = detect_careless_responses(df, cd)
+        assert "fast_response" not in without_time["signals_used"]
+
+        df["duration_sec"] = np.random.uniform(60, 300, len(df))
+        with_time = detect_careless_responses(df, cd, time_column="duration_sec")
+        assert "fast_response" in with_time["signals_used"]
+
+
+class TestDataQualityGate:
+    """
+    Phase 3 / L1: Stage B must never drop a sample on Cook's Distance alone --
+    it needs a corroborating data-quality signal. These tests use the same
+    weak-effect-suppressed-by-outliers shape as
+    test_stage_b_search_finds_significance_with_l1_disabled, but vary whether
+    the outlier rows also look like genuinely careless responses.
+    """
+
+    def test_l1_gate_blocks_statistically_convenient_but_unflagged_drop(self):
+        # Same outliers as the L1-disabled test above: extreme, high-leverage,
+        # but each B-item was perturbed by a *different* amount, so the row
+        # isn't straight-lined and IRV stays normal -- only Mahalanobis fires.
+        # With min_signals=2 (default), that's not enough to authorize a drop,
+        # so the search must fail even though it would trivially succeed with
+        # the gate off.
         np.random.seed(11)
         n = 100
         F_A = np.random.normal(0, 1, n)
@@ -356,13 +457,44 @@ class TestOptimizeUnified:
         sm = {"B": ["A"]}
 
         result = optimize_unified(df, cd, sm, max_drop_ratio=0.10, boot_iterations=150)
-        assert result["status"] == "completed"
+        assert result["data_quality"]["flagged_count"] == 0
+        entry = result["stage_b"][0]
+        assert entry["baseline"]["significant"] is False
+        assert entry["status"] == "failed"
+        assert entry["max_drop"] == 0
+        assert len(result["construct_review_suggestions"]) == 1
+
+    def test_l1_gate_allows_drop_when_rows_are_genuinely_flagged(self):
+        # Same weak underlying effect, but this time the disruptive rows are
+        # straight-lined (constant across all items in the row) as well as
+        # high-leverage -- a realistic careless-response pattern that trips
+        # both the Mahalanobis and long-string signals. The search should
+        # succeed, and it should only ever have dropped flagged respondents.
+        np.random.seed(11)
+        n = 100
+        F_A = np.random.normal(0, 1, n)
+        F_B = 0.30 * F_A + 1.0 * np.random.normal(0, 1, n)
+        data = {
+            "A1": F_A + np.random.normal(0, 0.3, n), "A2": F_A + np.random.normal(0, 0.3, n), "A3": F_A + np.random.normal(0, 0.3, n),
+            "B1": F_B + np.random.normal(0, 0.3, n), "B2": F_B + np.random.normal(0, 0.3, n), "B3": F_B + np.random.normal(0, 0.3, n),
+        }
+        df = pd.DataFrame(data)
+        for i, (a_val, b_val) in zip([2, 5, 9], [(3.0, -8.0), (-3.0, 8.0), (3.0, -9.0)]):
+            for col in ["A1", "A2", "A3"]:
+                df.loc[i, col] = a_val
+            for col in ["B1", "B2", "B3"]:
+                df.loc[i, col] = b_val
+        cd = {"A": ["A1", "A2", "A3"], "B": ["B1", "B2", "B3"]}
+        sm = {"B": ["A"]}
+
+        result = optimize_unified(df, cd, sm, max_drop_ratio=0.10, boot_iterations=150)
+        flagged = set(result["data_quality"]["flagged_indices"])
+        assert {2, 5, 9}.issubset(flagged)
         entry = result["stage_b"][0]
         assert entry["baseline"]["significant"] is False
         assert entry["status"] == "success"
         assert entry["final_p"] < 0.05
-        assert entry["drop_pct"] <= 10.5
-        assert result["construct_review_suggestions"] == []
+        assert set(entry["dropped_indices"]).issubset(flagged)
 
 
 class TestCompositeScore:
@@ -480,6 +612,34 @@ class TestAPIEndpoints:
     def test_optimize_full_search_requires_data(self):
         client = _make_client()
         r = client.post("/optimize/full-search", json={"structural_model": {"PE": ["TR"]}})
+        assert r.status_code == 400
+
+    def test_optimize_full_search_carries_data_quality_by_default(self, synthetic_df, construct_dict, structural_model):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/optimize/full-search", json={
+            "structural_model": structural_model,
+            "boot_iterations": 100,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["data_quality"] is not None
+        assert "flagged_indices" in data["data_quality"]
+
+    def test_analyze_data_quality_endpoint(self, synthetic_df, construct_dict):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/analyze/data-quality", json={})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["success"] is True
+        assert data["total_respondents"] == len(synthetic_df)
+        assert set(data["signals_used"]) == {"mahalanobis", "low_irv", "long_string"}
+        assert len(data["respondents"]) == len(synthetic_df)
+
+    def test_analyze_data_quality_requires_data(self):
+        client = _make_client()
+        r = client.post("/analyze/data-quality", json={"construct_dict": {"TR": ["TR1", "TR2"]}})
         assert r.status_code == 400
 
     def test_session_info(self, synthetic_df, construct_dict):

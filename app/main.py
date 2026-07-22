@@ -31,6 +31,7 @@ from app.stats_engine import (
     optimize_measurement,
     optimize_structural_path,
     optimize_unified,
+    detect_careless_responses,
     calc_deleted_alpha,
     calc_composite_score,
     calc_reverse_item_flags,
@@ -274,6 +275,15 @@ class OptimizeFullSearchInput(BaseModel):
     construct_dict: Optional[Dict[str, List[str]]] = None
     max_drop_ratio: Optional[float] = 0.10
     boot_iterations: Optional[int] = 300
+    require_data_quality_flag: Optional[bool] = True
+    time_column: Optional[str] = None
+    min_signals: Optional[int] = 2
+
+
+class DataQualityInput(BaseModel):
+    construct_dict: Optional[Dict[str, List[str]]] = None
+    time_column: Optional[str] = None
+    min_signals: Optional[int] = 2
 
 
 class EfaInput(BaseModel):
@@ -823,12 +833,37 @@ async def optimize_full_search(request: Request, body: OptimizeFullSearchInput):
             structural_model=body.structural_model,
             max_drop_ratio=body.max_drop_ratio or 0.10,
             boot_iterations=body.boot_iterations or 300,
+            require_data_quality_flag=body.require_data_quality_flag if body.require_data_quality_flag is not None else True,
+            time_column=body.time_column,
+            min_signals=body.min_signals or 2,
         )
         session["optimized_construct_dict"] = result["stage_a"]["optimized_construct_dict"]
         save_session(session.get("df"), session.get("construct_dict", {}), result["stage_a"]["optimized_construct_dict"], request=request)
         return {"success": True, **result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"統一最佳化引擎執行失敗：{e}")
+
+
+@app.post("/analyze/data-quality")
+async def analyze_data_quality(request: Request, body: DataQualityInput):
+    session = _get_user_session(request)
+    df = session.get("df")
+    if df is None:
+        raise HTTPException(status_code=400, detail="請先上傳資料檔案")
+
+    construct_dict = body.construct_dict or session.get("construct_dict", {})
+    if not construct_dict:
+        raise HTTPException(status_code=400, detail="請提供 construct_dict")
+
+    try:
+        result = detect_careless_responses(
+            df, construct_dict,
+            time_column=body.time_column,
+            min_signals=body.min_signals or 2,
+        )
+        return {"success": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"資料品質診斷失敗：{e}")
 
 
 # ─── Full Pipeline (convenience endpoint) ────────────────────────

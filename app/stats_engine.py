@@ -403,6 +403,117 @@ def optimize_measurement(df: pd.DataFrame, construct_dict: Dict[str, List[str]])
 
 
 # ─────────────────────────────────────────────
+# DATA QUALITY LAYER (L1) — Multi-signal careless-responding detection
+# See ARCHITECTURE.md L1 / Curran (2016): no single indicator (e.g. Mahalanobis
+# distance alone) is trustworthy on its own. This layer only diagnoses and
+# labels respondents -- it never deletes anything itself. Whether to act on a
+# flag is either a human decision, or (see optimize_structural_path's
+# allowed_drop_indices) a hard constraint on what Stage B is allowed to touch.
+# ─────────────────────────────────────────────
+
+def _mahalanobis_distances(sub: pd.DataFrame) -> np.ndarray:
+    """Squared Mahalanobis distance of each row from the item-set centroid."""
+    X = sub.values.astype(float)
+    mean = np.mean(X, axis=0)
+    cov = np.cov(X, rowvar=False)
+    # Small ridge regularization guards against a near-singular covariance
+    # matrix, which is common when items within a construct are highly
+    # correlated (as they should be for a valid measurement model).
+    p = cov.shape[0]
+    reg = (1e-6 * np.trace(cov) / p) if p > 0 else 1e-6
+    inv_cov = np.linalg.inv(cov + reg * np.eye(p))
+    diff = X - mean
+    return np.einsum("ij,jk,ik->i", diff, inv_cov, diff)
+
+
+def _longest_run(values: np.ndarray) -> int:
+    """Longest run of identical consecutive (non-NaN) values in a 1D array."""
+    longest = current = 1
+    for i in range(1, len(values)):
+        a, b = values[i - 1], values[i]
+        same = (a == b) and not (pd.isna(a) or pd.isna(b))
+        current = current + 1 if same else 1
+        longest = max(longest, current)
+    return longest
+
+
+def detect_careless_responses(
+    df: pd.DataFrame,
+    construct_dict: Dict[str, List[str]],
+    time_column: Optional[str] = None,
+    min_signals: int = 2,
+    mahalanobis_alpha: float = 0.001,
+    irv_percentile: float = 5.0,
+    long_string_ratio: float = 0.5,
+    fast_response_percentile: float = 5.0,
+) -> dict:
+    """
+    Multi-signal careless-responding detection:
+    - Mahalanobis distance: multivariate outlier on the full item set.
+    - IRV (intra-individual response variability): near-zero row-wise SD
+      indicates straight-lining.
+    - Long-string: longest run of identical consecutive answers.
+    - Response time (optional, only if `time_column` is present): unusually
+      fast completion.
+
+    A respondent is only "recommended for review" when at least
+    `min_signals` independent signals agree -- a single triggered signal is
+    not enough (Curran, 2016).
+    """
+    all_items = [item for items in construct_dict.values() for item in items if item in df.columns]
+    sub = df[all_items].apply(pd.to_numeric, errors="coerce")
+    n = len(sub)
+
+    signals: Dict[str, pd.Series] = {}
+
+    try:
+        filled = sub.fillna(sub.mean(numeric_only=True))
+        d2 = _mahalanobis_distances(filled)
+        threshold = stats.chi2.ppf(1 - mahalanobis_alpha, df=len(all_items))
+        signals["mahalanobis"] = pd.Series(d2 > threshold, index=sub.index)
+    except Exception:
+        signals["mahalanobis"] = pd.Series(False, index=sub.index)
+
+    irv = sub.std(axis=1, ddof=0)
+    irv_cutoff = np.nanpercentile(irv.dropna(), irv_percentile) if irv.notna().any() else 0.0
+    signals["low_irv"] = (irv <= irv_cutoff).fillna(False)
+
+    long_string_threshold = max(2, int(len(all_items) * long_string_ratio))
+    signals["long_string"] = sub.apply(lambda row: _longest_run(row.values), axis=1) >= long_string_threshold
+
+    if time_column and time_column in df.columns:
+        times = pd.to_numeric(df[time_column], errors="coerce")
+        if times.notna().any():
+            cutoff = np.nanpercentile(times.dropna(), fast_response_percentile)
+            signals["fast_response"] = (times <= cutoff).fillna(False)
+
+    flag_df = pd.DataFrame(signals)
+    signal_count = flag_df.sum(axis=1)
+    recommend_review = signal_count >= min_signals
+
+    respondents = []
+    for idx in df.index:
+        triggered = [s for s in flag_df.columns if bool(flag_df.loc[idx, s])]
+        respondents.append({
+            "index": int(idx) if isinstance(idx, (int, np.integer)) else str(idx),
+            "signals_triggered": triggered,
+            "signal_count": int(signal_count.loc[idx]),
+            "recommend_review": bool(recommend_review.loc[idx]),
+        })
+
+    flagged_indices = [r["index"] for r in respondents if r["recommend_review"]]
+
+    return {
+        "signals_used": list(flag_df.columns),
+        "min_signals_required": min_signals,
+        "total_respondents": n,
+        "flagged_count": len(flagged_indices),
+        "flagged_indices": flagged_indices,
+        "respondents": respondents,
+    }
+
+
+# ─────────────────────────────────────────────
 # OPTIMIZATION ENGINE — TIER 2
 # Structural Model Auto-Fix (Cook's Distance Targeted Removal)
 # ─────────────────────────────────────────────
@@ -415,10 +526,17 @@ def optimize_structural_path(
     target_dep: str,
     max_drop_ratio: float = 0.10,
     boot_iterations: int = 300,
+    allowed_drop_indices: Optional[List] = None,
 ) -> dict:
     """
     Cook's Distance targeted outlier removal to achieve significance
     on a specific path with minimum sample deletion.
+
+    allowed_drop_indices: if given, restricts candidate deletions to this
+    set of df.index labels (e.g. the L1 data-quality flagged respondents).
+    This is what turns "drop whoever has the highest Cook's Distance" into
+    "drop whoever has the highest Cook's Distance among samples that also
+    have a substantive quality-flag reason" -- see ARCHITECTURE.md L1/L4.
     """
     latent = pd.DataFrame({c: df[items].mean(axis=1) for c, items in construct_dict.items() if all(i in df.columns for i in items)})
 
@@ -435,13 +553,26 @@ def optimize_structural_path(
     cooks_d = influence.cooks_distance[0]
 
     # Rank samples by Cook's Distance (descending = most disruptive first)
-    outlier_order = np.argsort(cooks_d)[::-1]
-    max_drop = int(len(df) * max_drop_ratio)
+    outlier_order = list(np.argsort(cooks_d)[::-1])
+
+    if allowed_drop_indices is not None:
+        allowed_set = set(allowed_drop_indices)
+        outlier_order = [i for i in outlier_order if df.index[i] in allowed_set]
+
+    max_drop = min(int(len(df) * max_drop_ratio), len(outlier_order))
+
+    if max_drop == 0:
+        return {
+            "status": "failed",
+            "max_drop": 0,
+            "drop_log": [],
+            "msg": "🔴 沒有樣本同時符合「Cook's Distance 高」與「L1 資料品質標記」兩個條件，無法在有實質理由的前提下刪除任何樣本。",
+        }
 
     drop_log = []
 
     for drop_count in range(1, max_drop + 1):
-        drop_idx = list(outlier_order[:drop_count])
+        drop_idx = outlier_order[:drop_count]
         clean_df = df.drop(df.index[drop_idx])
 
         path_results = calc_bootstrapping(clean_df, construct_dict, structural_model, iterations=boot_iterations)
@@ -499,6 +630,9 @@ def optimize_unified(
     structural_model: Dict[str, List[str]],
     max_drop_ratio: float = 0.10,
     boot_iterations: int = 300,
+    require_data_quality_flag: bool = True,
+    time_column: Optional[str] = None,
+    min_signals: int = 2,
 ) -> dict:
     """
     Stage A: run optimize_measurement() as a hard gate. If any construct
@@ -512,6 +646,14 @@ def optimize_unified(
     reported as-is, not re-searched. Paths that remain non-significant even
     after the max sample-drop budget produce a human-reviewed suggestion to
     consider construct-level changes -- never an automatic deletion.
+
+    require_data_quality_flag (default True, the enforced rule from
+    ARCHITECTURE.md L1/L4): runs detect_careless_responses() on the Stage-A
+    data and restricts Stage B to only ever drop respondents flagged by at
+    least `min_signals` independent data-quality signals -- a high Cook's
+    Distance alone is never sufficient justification. Set False only for
+    debugging/comparison against the pre-L1 behavior; do not disable it for
+    a result that will be reported as anything other than exploratory.
     """
     stage_a = optimize_measurement(df, construct_dict)
     stage_a_passed = all(entry["action"] != "⚠️ 無可救藥" and entry["action"] != "❌ 計算錯誤" for entry in stage_a["log"])
@@ -525,6 +667,7 @@ def optimize_unified(
         },
         "stage_b": None,
         "construct_review_suggestions": [],
+        "data_quality": None,
     }
 
     if not stage_a_passed:
@@ -538,6 +681,15 @@ def optimize_unified(
         return result
 
     baseline_paths = calc_bootstrapping(df, optimized_construct_dict, structural_model, iterations=boot_iterations)
+
+    data_quality = None
+    allowed_drop_indices = None
+    if require_data_quality_flag:
+        data_quality = detect_careless_responses(
+            df, optimized_construct_dict, time_column=time_column, min_signals=min_signals
+        )
+        allowed_drop_indices = data_quality["flagged_indices"]
+    result["data_quality"] = data_quality
 
     stage_b_results = []
     for path in baseline_paths:
@@ -559,6 +711,7 @@ def optimize_unified(
                 target_dep=path["dependent"],
                 max_drop_ratio=max_drop_ratio,
                 boot_iterations=boot_iterations,
+                allowed_drop_indices=allowed_drop_indices,
             )
             entry.update(search)
             if search.get("status") == "failed":
