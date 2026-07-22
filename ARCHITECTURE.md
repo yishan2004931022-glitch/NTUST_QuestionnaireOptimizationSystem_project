@@ -16,6 +16,7 @@
 6. [跨類型窮舉比較引擎：設計演進紀錄](#六跨類型窮舉比較引擎設計演進紀錄)
 7. [參考文獻](#七參考文獻)
 8. [範疇確認與技術棧決策（2026-07-20 更新）](#八範疇確認與技術棧決策2026-07-20-更新)
+9. [Phase 1 統計框架完成紀錄（2026-07-22 更新）](#九phase-1-統計框架完成紀錄2026-07-22-更新)
 
 ---
 
@@ -114,21 +115,19 @@ Simmons, Nelson & Simonsohn (2011) 證明：不揭露的研究者自由度（要
 - 採「多訊號收斂」而非單一指標：至少兩個獨立訊號同時亮起，才列入「建議複查」名單。
 - 這一層只**診斷、標記原因**，不執行刪除——刪不刪是研究者或 L4 的決定，不是這一層的權責。
 
-### L2 · 測量模型層 — 現有系統已有雛形（`optimize_measurement`），缺 HTMT、缺完整 EFA
+### L2 · 測量模型層 — ✅ 統計面已補齊（見第九節）
 
-信度（α、CR）、收斂效度（Loading、AVE）、區辨效度——以 **HTMT** 為主要判準（比 Fornell-Larcker 更敏感），嚴格門檻 0.85 / 寬鬆 0.90。**硬性關卡**：L3 必須等 L2 全數通過才能執行。
+信度（α、CR）、收斂效度（Loading、AVE）、區辨效度——以 **HTMT** 為主要判準（比 Fornell-Larcker 更敏感）。**硬性關卡**：L3 必須等 L2 全數通過才能執行（這條關卡本身還沒程式碼強制，見下方 L4）。
 
 - 沿用貪婪刪題項邏輯，但輸出是一個新版本的「純化後模型」，原始上傳資料永遠不被覆寫。
-- 程式碼層面直接擋：L3 的端點會檢查目前模型版本是否已通過 L2，沒過就回錯誤，除非有明確登記理由的人工 override。
-- **另一個缺口（見第八節 8.2）**：現有 `calc_loadings_ave_cr()` 是「單構面單因子 EFA」，前提是構面分組已經正確；缺一個「全題項一次跑多因子 EFA + Parallel Analysis 因子保留判準」的功能，才能真正驗證問向（構面）分組本身合不合理，而不是只驗證分組內的信效度。同樣缺 Deleted Alpha（逐題刪除後 α 的變化）這個 Cronbach 分析的標準附帶輸出。
+- 程式碼層面直接擋：L3 的端點會檢查目前模型版本是否已通過 L2，沒過就回錯誤，除非有明確登記理由的人工 override——**這條關卡尚未實作**，目前 `/analyze/structural` 跟 `/analyze/seminr` 都可以在沒過 L2 的情況下直接呼叫。
+- ~~缺 HTMT、缺完整 EFA~~ 已解決：`/analyze/efa`（`r/efa_wrapper.R`，全題項多因子 EFA + Parallel Analysis）+ `/analyze/seminr`（`r/seminr_wrapper.R`，內含 HTMT）+ `/analyze/deleted-alpha`。詳見第九節。
 
-### L3 · 結構模型層 — 現有系統只做了一半
+### L3 · 結構模型層 — ✅ 大部分完成，SRMR 刻意暫緩（見第九節）
 
-現有系統只有 R²、VIF、Bootstrapped P 值。完整的 PLS-SEM 結構模型評估還需要樣本內跟樣本外兩種指標：
-
-- **樣本內（in-sample）**：路徑係數 + Bootstrap CI、R²、**f² 效果量**。
-- **樣本外（out-of-sample）**：**Q²（blindfolding 預測相關性）**、**PLSpredict**、**SRMR** 整體配適度。
-- 少了樣本外指標，模型可能只是「解釋力好看」但預測力差——這在現有系統跟教授原本的構想裡都沒被提到，是完整性上最大的缺口。
+- **樣本內（in-sample）**：路徑係數 + Bootstrap CI/P 值、R²、**f² 效果量** — ✅ 已完成，`/analyze/seminr`。
+- **樣本外（out-of-sample）**：**Q²predict / PLSpredict**（Shmueli et al. 2019 的現代作法，取代傳統 blindfolding）— ✅ 已完成，同一端點。
+- **SRMR** 整體配適度 — ❌ 刻意不做：seminr 套件本身沒有內建 SRMR 函數，手刻公式沒有經過驗證，寧可先留白也不要生出一個沒人檢查過對不對的數字。之後若要補，必須先找到可以對答案的參照實作（例如拿真實資料同時餵 SmartPLS 比對）才能上。
 
 ### L4 · 情境式最佳化層 — 對應「跨類型窮舉比較引擎」，需要重新設計
 
@@ -138,13 +137,13 @@ Simmons, Nelson & Simonsohn (2011) 證明：不揭露的研究者自由度（要
 - 強制規則：任何樣本排除都要能對應到 L1 標記的至少一個實質理由，不能只憑「Cook's Distance 比較高」這種純統計理由。
 - 每份情境報告固定帶著「**EXPLORATORY · 事後分析，非驗證性結果**」標籤，跟 L0 宣告的 confirmatory 假設視覺上明確分開。
 
-### L5 · 審計與版本層 — 現有系統是全域記憶體 dict，等同於沒有
+### L5 · 審計與版本層 — 🟡 多使用者隔離已解決，正式版控/審計仍未做
 
 不是流程裡的一個步驟，而是所有層共用的底層機制——概念上借用 DVC / MLflow 的 provenance 模式。
 
-- 每個動作（上傳、L2 純化、L4 情境）都是一筆不可變、有時間戳記、只能新增不能修改的紀錄。
-- 用真正的資料庫（不是現有系統的全域記憶體 dict）保存，以「研究 × 資料版本 × 分析執行」為主鍵，讓口試委員可以完整重放從原始資料到最終數字的每一步。
-- 現有系統的 `SESSION: Dict = {}` 是**全域單一變數**，不只沒有版控，連多使用者隔離都沒有——兩個人同時用部署好的網址會互相覆蓋資料，這是目前最迫切的問題（見第五節 Phase 0）。
+- 每個動作（上傳、L2 純化、L4 情境）都是一筆不可變、有時間戳記、只能新增不能修改的紀錄——**尚未實作**。
+- 用真正的資料庫（不是現有系統的全域記憶體 dict）保存，以「研究 × 資料版本 × 分析執行」為主鍵，讓口試委員可以完整重放從原始資料到最終數字的每一步——**尚未實作**。
+- ~~現有系統的 `SESSION: Dict = {}` 是全域單一變數，兩個人同時用會互相覆蓋資料~~ 已解決：`app/session_store.py` 依 API token / `x-session-id` 分開存（記憶體 dict 依 key 分流 + 落地成每人一份 JSON 檔），多使用者不會再互相覆蓋。但這是檔案存放，不是正式資料庫，也還沒有不可變審計紀錄——Phase 4 的完整版本仍未開始。
 
 ### L6 · 呈現層 — 現有系統完全沒有前端
 
@@ -285,8 +284,57 @@ R / plumber（純統計運算服務，不處理對話、不對外公開）
 - 兩服務用內部 HTTP 溝通，不用 rpy2 把 R 直接嵌進 Python process——避免版本相容性問題、資料型別轉換問題，以及跨語言 debug 困難。R 服務不對外公開，只有 Python 服務打得到，兩者可以獨立部署、獨立除錯。
 - 代價：Tier 1/Tier 2 優化迴圈每輪迭代都要重新呼叫 R 服務算一次指標，屬於高頻呼叫，R 服務需要保持常駐熱機、跟 Python 服務部署在同一個內部網路，避免延遲拖垮使用者體驗。
 
+> **實作落差（2026-07-22 補記）**：實際做出來的不是「R 包成 plumber 常駐服務、走內部 HTTP」，而是 `app/r_bridge.py` 每次請求用 `subprocess.run(["Rscript", ...])` 直接跑一支 R 腳本、用暫存檔案交換資料，跑完就結束——R 沒有常駐，每次呼叫都重新啟動一次直譯器。比原計畫簡單、部署也不用管兩個服務怎麼串，但代價是上面講的「高頻呼叫」場景（Tier 1/2 優化迴圈）會被 R 重啟成本拖慢。目前只有單次呼叫 EFA/seminr，還沒接優化迴圈，暫時沒事；等 Phase 2 要把優化迴圈接上 R 的時候，需要重新評估要不要換成常駐服務。
+
 ### 8.4 待補功能清單（併入 Phase 1，見第五節）
 
-- 完整多因子 EFA + Parallel Analysis（R `psych`）——對應 8.2 缺口
-- Deleted Alpha（逐題刪除後 α 變化）——小功能，Cronbach 分析的標準附帶輸出
-- Composite Score 待決定是否從現有的簡單平均升級為 `seminr` 的正統 PLS 加權組合分數（現況是簡化版，非嚴格 PLS-SEM 演算法）
+- ~~完整多因子 EFA + Parallel Analysis（R `psych`）~~ ✅ 已完成，見第九節
+- ~~Deleted Alpha~~ ✅ 已完成，`calc_deleted_alpha` / `/analyze/deleted-alpha`
+- Composite Score 從簡單平均升級為 `seminr` 的正統 PLS 加權組合分數——🟡 部分完成：`calc_composite_score(weighting="loading")` 現在用 Python 自己單因子 EFA 的 loading 加權，比簡單平均進步，但仍不是呼叫 `seminr` 算出的真正 PLS outer weight（`results$composite_scores`，R 端已確認可以拿到，只是還沒接進 Python 這邊）——留給下次處理
+
+---
+
+## 九、Phase 1 統計框架完成紀錄（2026-07-22 更新）
+
+### 9.1 這次做了什麼
+
+把 `r/seminr_wrapper.R`（`/analyze/seminr` 端點）補完成含 HTMT、f²、Q²predict/PLSpredict 的完整版，同時發現並修掉一個**先前就已經存在、還沒被發現的嚴重 bug**：這個端點從被寫出來開始就沒有真正成功執行過一次。
+
+### 9.2 發現的 bug：seminr 套件 API 版本落差
+
+容器裡裝的是 `seminr 2.5.0`（R 4.5.0），舊版 wrapper 用的寫法在這個版本完全不存在：
+
+| 舊 wrapper 用的寫法 | 這個版本實際要用的寫法 |
+|---|---|
+| `items(item_vector)` | 直接傳向量給 `composite(name, item_vector)`，不用包一層 |
+| `pls_model(mm, sm)` + `pls(data, model)` | `estimate_pls(data, measurement_model, structural_model)` |
+| `boot(results, R = 200)` | `bootstrap_model(seminr_model, nboot = 500)` |
+| `do.call(paths, path_list)` 直接當結構模型用 | `paths()` 只回傳單組 from/to 關係（純字元向量，沒有維度），要用 `relationships(paths(...), paths(...), ...)` 包起來才是 `estimate_pls()` 吃得下的結構模型物件——這個沒包對，會在 `estimate_pls()` 內部丟出語意完全不相關的錯誤（`incorrect number of dimensions`），很難從錯誤訊息猜到根因 |
+
+**後果**：R 腳本內部的 `tryCatch` 會抓到這些錯誤、寫進 `error` 欄位，`app/r_bridge.py` 的 `run_seminr()` 讀到非空的 `error` 欄位就會拋 `RBridgeError`，端點回 500——但因為錯誤訊息（例如 `could not find function "items"`）沒有明顯指向「API 版本不對」，加上端點本身有測試覆蓋卻斷言寫得很鬆（原本只檢查回傳的 dict 裡有沒有 `"success"`、`"loadings"`、`"suggested_new_items"` 三個 key 的其中一個，而 `{"success": True, ...}` 這個 shape 太容易「巧合」符合），這個 bug 才一直沒被抓出來。
+
+**教訓**：這是這個 session 第二次遇到「表面上測試綠燈/回應 200，但底層邏輯其實沒有真正跑起來」的狀況（第一次是 `/analyze/llm-suggestions` 那三個疊在一起的 bug）。**針對外部套件/API 呼叫寫測試時，斷言要驗證實際數值是否合理（例如 p-value 跟 t-stat 要邏輯一致、HTMT 要在 0~2 之間），不能只檢查「有沒有回傳某個 key」**——後者對「呼叫失敗但格式恰好符合」這種狀況完全沒有防禦力。
+
+### 9.3 現在 `/analyze/seminr` 回傳的完整欄位
+
+```
+{
+  measurement_loadings, reliability,           # 原本就有
+  validity: { htmt },                          # 新增
+  f_squared,                                    # 新增
+  paths: { beta, t_stat, p_value, ci_2_5, ci_97_5, ... },  # p_value 欄位原本對到錯的 R 欄位，已修正
+  r_squared: { construct: { r_squared, adj_r_squared } },  # 原本是空的，已修正
+  vif,
+  predictive: { item: { q2predict, rmse_pls, rmse_lm_benchmark, beats_lm_benchmark } }  # 新增
+}
+```
+
+`predictive` 只會出現結構模型裡「內生（依變數）構面」的題項——外生構面沒有任何路徑指向它，本來就沒有「被預測」這件事，這是 PLSpredict 方法論本身的限制，不是漏算。
+
+### 9.4 SRMR 仍未實作（刻意決定，不是漏掉）
+
+`seminr` 套件沒有內建 SRMR 函數。手刻公式在技術上做得到，但沒有驗證過的公式產出一個「看起來正常但可能是錯的」配適度指標，比直接不做的風險更高——尤其這個系統沒有直接競品可以拿來對答案（見先前討論），任何新增的數字都只能靠自己驗證。**先不做，等有機會拿真實資料同時跑 SmartPLS 或另一個獨立實作對照過，確認公式對得上，才要加回來。**
+
+### 9.5 測試強化
+
+`tests/test_r_endpoints.py::TestSeminrEndpoint::test_seminr_endpoint` 從單一鬆散斷言改成逐項檢查：AVE/CR 落在 0~1、HTMT 落在合理範圍、p-value 與 t-stat 邏輯一致（t > 2.6 時 p < 0.05）、R² 落在 0~1、predictive 欄位只涵蓋內生構面題項且 RMSE > 0。50/50 全域測試（含這批）在乾淨環境下通過。
