@@ -39,6 +39,7 @@ from app.stats_engine import (
 )
 from app.r_bridge import run_efa, run_seminr, RBridgeError
 from app.session_store import save_session, load_session, clear_session
+from app import db as audit_db
 
 app = FastAPI(
     title="Survey Co-Pilot API",
@@ -312,6 +313,13 @@ class LLMInput(BaseModel):
     max_tokens: Optional[int] = 1200
 
 
+class DeclarationInput(BaseModel):
+    measurement_model: Dict[str, List[str]]
+    structural_model: Dict[str, List[str]]
+    label: Optional[str] = None
+    notes: Optional[str] = None
+
+
 class TokenIssueInput(BaseModel):
     token: str
     owner: Optional[str] = ""
@@ -344,19 +352,32 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
     try:
         df, construct_dict = load_data(tmp_path)
+        user_id = _resolve_user_id(request)
+        declaration_id = _get_user_session(request).get("declaration_id")
+        dataset_record = audit_db.record_dataset(user_id, df, filename=file.filename, declaration_id=declaration_id)
         session = {
             "df": df,
             "construct_dict": construct_dict,
             "filepath": tmp_path,
+            "dataset_id": dataset_record["id"],
+            "declaration_id": declaration_id,
         }
         _set_user_session(request, session)
         save_session(df, construct_dict, request=request)
+        audit_db.log_action(
+            user_id, "upload",
+            dataset_id=dataset_record["id"], declaration_id=declaration_id,
+            request_params={"filename": file.filename},
+            result_summary={"rows": len(df), "columns": len(df.columns), "constructs": list(construct_dict.keys()), "file_hash": dataset_record["file_hash"]},
+            is_exploratory=False,
+        )
         return {
             "success": True,
             "rows": len(df),
             "columns": len(df.columns),
             "constructs": {k: v for k, v in construct_dict.items()},
             "all_columns": df.columns.tolist(),
+            "dataset_id": dataset_record["id"],
             "message": f"成功載入 {len(df)} 份問卷，偵測到 {len(construct_dict)} 個構面。",
         }
     except Exception as e:
@@ -746,7 +767,7 @@ async def analyze_structural(request: Request, body: StructuralModelInput):
         significant_paths = sum(1 for r in bootstrapping if r.get("significant"))
         total_paths = len(bootstrapping)
 
-        return {
+        response = {
             "bootstrapping": bootstrapping,
             "vif": vif,
             "r_squared": r2,
@@ -756,6 +777,14 @@ async def analyze_structural(request: Request, body: StructuralModelInput):
                 "insignificant_paths": total_paths - significant_paths,
             },
         }
+        audit_db.log_action(
+            _resolve_user_id(request), "analyze_structural",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"structural_model": body.structural_model, "boot_iterations": body.boot_iterations},
+            result_summary=response,
+            is_exploratory=False,
+        )
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"結構模型分析失敗：{e}")
 
@@ -775,6 +804,13 @@ async def optimize_measurement_endpoint(request: Request, body: OptimizeMeasurem
         result = optimize_measurement(df, construct_dict)
         session["optimized_construct_dict"] = result["optimized_construct_dict"]
         save_session(session.get("df"), session.get("construct_dict", {}), result["optimized_construct_dict"], request=request)
+        audit_db.log_action(
+            _resolve_user_id(request), "optimize_measurement",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"construct_dict": construct_dict},
+            result_summary=result,
+            is_exploratory=False,
+        )
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"測量模型最佳化失敗：{e}")
@@ -805,6 +841,16 @@ async def optimize_path_endpoint(request: Request, body: OptimizePathInput):
             target_dep=body.target_dep,
             max_drop_ratio=body.max_drop_ratio,
             boot_iterations=body.boot_iterations,
+        )
+        audit_db.log_action(
+            _resolve_user_id(request), "optimize_path",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={
+                "target_indep": body.target_indep, "target_dep": body.target_dep,
+                "structural_model": body.structural_model, "max_drop_ratio": body.max_drop_ratio,
+            },
+            result_summary=result,
+            is_exploratory=True,
         )
         return result
     except Exception as e:
@@ -839,6 +885,13 @@ async def optimize_full_search(request: Request, body: OptimizeFullSearchInput):
         )
         session["optimized_construct_dict"] = result["stage_a"]["optimized_construct_dict"]
         save_session(session.get("df"), session.get("construct_dict", {}), result["stage_a"]["optimized_construct_dict"], request=request)
+        audit_db.log_action(
+            _resolve_user_id(request), "optimize_full_search",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"structural_model": body.structural_model, "max_drop_ratio": body.max_drop_ratio},
+            result_summary=result,
+            is_exploratory=True,
+        )
         return {"success": True, **result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"統一最佳化引擎執行失敗：{e}")
@@ -1046,6 +1099,53 @@ async def session_info(request: Request):
     }
 
 
+@app.post("/declare")
+async def declare(request: Request, body: DeclarationInput):
+    """
+    L0: declare the theory (constructs + hypothesized paths) BEFORE running
+    any analysis. This timestamp is the confirmatory/exploratory dividing
+    line -- anything the L4 search engine does afterward is exploratory by
+    construction, regardless of what gets declared here. Declaring links
+    to the current session's dataset if one is already uploaded; if not,
+    it will be linked on the next /upload.
+    """
+    user_id = _resolve_user_id(request)
+    declaration = audit_db.create_declaration(
+        user_id, body.measurement_model, body.structural_model,
+        label=body.label, notes=body.notes,
+    )
+    session = _get_user_session(request)
+    session["declaration_id"] = declaration["id"]
+    return {"success": True, **declaration}
+
+
+@app.get("/declare/{declaration_id}")
+async def get_declaration(request: Request, declaration_id: int):
+    declaration = audit_db.get_declaration(declaration_id)
+    if declaration is None:
+        raise HTTPException(status_code=404, detail="宣告不存在")
+    if declaration["user_id"] != _resolve_user_id(request):
+        raise HTTPException(status_code=404, detail="宣告不存在")
+    return declaration
+
+
+@app.get("/audit/history")
+async def audit_history(request: Request, limit: int = 200):
+    user_id = _resolve_user_id(request)
+    dataset_id = _get_user_session(request).get("dataset_id")
+    return {"entries": audit_db.get_audit_history(user_id, dataset_id=dataset_id, limit=limit)}
+
+
+@app.get("/audit/{entry_id}")
+async def audit_entry(request: Request, entry_id: int):
+    entry = audit_db.get_audit_entry(entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="審計紀錄不存在")
+    if entry["user_id"] != _resolve_user_id(request):
+        raise HTTPException(status_code=404, detail="審計紀錄不存在")
+    return entry
+
+
 @app.post("/session/switch")
 async def session_switch(request: Request, body: Optional[SessionSwitchInput] = None):
     user_id = body.user_id if body and body.user_id else ""
@@ -1069,6 +1169,11 @@ async def session_switch(request: Request, body: Optional[SessionSwitchInput] = 
 @app.on_event("startup")
 def _bootstrap_session() -> None:
     _inprocess_sessions.clear()
+
+
+@app.on_event("startup")
+def _bootstrap_audit_db() -> None:
+    audit_db.init_db()
 
 
 frontend_dir = os.environ.get("FRONTEND_DIR", "")

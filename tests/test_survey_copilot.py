@@ -30,10 +30,24 @@ from app.stats_engine import (
 
 from fastapi.testclient import TestClient
 from app.main import app, _inprocess_sessions
+from app import db as audit_db
 
 # ─────────────────────────────────────────────
 # Fixtures
 # ─────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def isolated_audit_db(tmp_path, monkeypatch):
+    """
+    Every test gets its own throwaway SQLite file instead of the real
+    /app/data/audit.db -- otherwise tests would accumulate rows across runs
+    (and across each other) and any assertion on row counts or "latest
+    entry" would be flaky.
+    """
+    monkeypatch.setattr(audit_db, "DB_PATH", str(tmp_path / "test_audit.db"))
+    audit_db.init_db()
+    yield
+
 
 @pytest.fixture
 def synthetic_df():
@@ -738,3 +752,113 @@ class TestEFAEndpoint:
     def test_efa_requires_data(self):
         r = _make_client().post("/analyze/efa", json={"max_factors": 2})
         assert r.status_code == 400
+
+
+# ─────────────────────────────────────────────
+# L0 declaration + L5 audit trail (Phase 4)
+# ─────────────────────────────────────────────
+
+class TestAuditDbModule:
+    """Direct tests against app/db.py, independent of the HTTP layer."""
+
+    def test_create_and_get_declaration(self):
+        decl = audit_db.create_declaration(
+            "user-a", {"TR": ["TR1", "TR2"]}, {"PE": ["TR"]}, label="H1"
+        )
+        assert decl["id"] is not None
+        assert decl["created_at"]  # timestamp is the confirmatory/exploratory dividing line
+        fetched = audit_db.get_declaration(decl["id"])
+        assert fetched["measurement_model"] == {"TR": ["TR1", "TR2"]}
+        assert fetched["structural_model"] == {"PE": ["TR"]}
+        assert fetched["label"] == "H1"
+
+    def test_record_dataset_hashes_content(self):
+        df1 = pd.DataFrame({"A": [1, 2, 3]})
+        df2 = pd.DataFrame({"A": [1, 2, 3]})  # same content
+        df3 = pd.DataFrame({"A": [1, 2, 4]})  # different content
+        rec1 = audit_db.record_dataset("user-a", df1, filename="a.csv")
+        rec2 = audit_db.record_dataset("user-a", df2, filename="a.csv")
+        rec3 = audit_db.record_dataset("user-a", df3, filename="a.csv")
+        assert rec1["file_hash"] == rec2["file_hash"]
+        assert rec1["file_hash"] != rec3["file_hash"]
+        assert rec1["id"] != rec2["id"]  # still two distinct immutable rows
+
+    def test_log_action_and_get_audit_history(self):
+        audit_db.log_action("user-a", "upload", result_summary={"rows": 10})
+        audit_db.log_action("user-a", "optimize_path", result_summary={"status": "success"}, is_exploratory=True)
+        audit_db.log_action("user-b", "upload", result_summary={"rows": 5})  # different user
+
+        history = audit_db.get_audit_history("user-a")
+        assert len(history) == 2
+        assert history[0]["action"] == "optimize_path"  # most recent first
+        assert history[0]["is_exploratory"] is True
+        assert history[1]["is_exploratory"] is False
+
+        history_b = audit_db.get_audit_history("user-b")
+        assert len(history_b) == 1
+
+    def test_get_audit_entry_full_replay_fidelity(self):
+        entry_id = audit_db.log_action(
+            "user-a", "optimize_full_search",
+            request_params={"structural_model": {"BI": ["TR"]}},
+            result_summary={"status": "completed", "stage_b": [1, 2, 3]},
+            is_exploratory=True,
+        )
+        entry = audit_db.get_audit_entry(entry_id)
+        assert entry["request_params"] == {"structural_model": {"BI": ["TR"]}}
+        assert entry["result_summary"] == {"status": "completed", "stage_b": [1, 2, 3]}
+
+    def test_no_update_or_delete_functions_exist(self):
+        # Immutability is enforced by API surface, not just convention --
+        # there should be nothing in this module capable of mutating an
+        # existing row.
+        exported = [name for name in dir(audit_db) if not name.startswith("_")]
+        assert not any("update" in name.lower() or "delete" in name.lower() for name in exported)
+
+
+class TestDeclarationAndAuditEndpoints:
+    def test_declare_then_upload_links_dataset_to_declaration(self, synthetic_df, construct_dict, structural_model):
+        client = _make_client()
+        r = client.post("/declare", json={
+            "measurement_model": construct_dict,
+            "structural_model": structural_model,
+            "label": "pilot",
+        })
+        assert r.status_code == 200
+        declaration_id = r.json()["id"]
+
+        _upload_synthetic(client, synthetic_df)
+        history = client.get("/audit/history").json()["entries"]
+        upload_entry = next(e for e in history if e["action"] == "upload")
+        assert upload_entry["declaration_id"] == declaration_id
+
+    def test_get_declaration_not_found(self):
+        r = _make_client().get("/declare/999999")
+        assert r.status_code == 404
+
+    def test_confirmatory_vs_exploratory_actions_flagged_correctly(self, synthetic_df, construct_dict, structural_model):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        client.post("/analyze/structural", json={"structural_model": {"PE": ["TR"]}})
+        client.post("/optimize/full-search", json={"structural_model": structural_model, "boot_iterations": 100})
+
+        history = client.get("/audit/history").json()["entries"]
+        by_action = {e["action"]: e for e in history}
+        assert by_action["analyze_structural"]["is_exploratory"] is False
+        assert by_action["optimize_full_search"]["is_exploratory"] is True
+
+    def test_audit_entry_not_visible_to_other_user(self, synthetic_df, construct_dict):
+        client_a = _make_client()
+        _upload_synthetic(client_a, synthetic_df)
+        entry_id = client_a.get("/audit/history").json()["entries"][0]["id"]
+
+        # A different user (distinct x-session-id) must not be able to read it.
+        client_b = _make_client(clear=False)
+        r = client_b.get(f"/audit/{entry_id}", headers={"x-session-id": "someone-else"})
+        assert r.status_code == 404
+
+    def test_audit_history_requires_no_upload_returns_empty(self):
+        client = _make_client()
+        r = client.get("/audit/history")
+        assert r.status_code == 200
+        assert r.json()["entries"] == []
