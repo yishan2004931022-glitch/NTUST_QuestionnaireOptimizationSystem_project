@@ -149,7 +149,9 @@ Phase 2 已完成：`optimize_unified()`（`app/stats_engine.py`）+ `POST /opti
 
 不是流程裡的一個步驟，而是所有層共用的底層機制——概念上借用 DVC / MLflow 的 provenance 模式，實作上是 SQLite（`app/db.py`，理由見第八節 8.3 一貫的「先求堪用、之後真的要上正式環境再換 Postgres」原則）。
 
-- **每個動作都是一筆不可變、有時間戳記、只能新增不能修改的紀錄**：`audit_log` 表，每次 `/upload`、`/analyze/structural`、`/optimize/measurement`、`/optimize/path`、`/optimize/full-search` 執行完都會寫入一筆，欄位包含完整的 request 參數跟 result 內容（不是摘要，是真的可以拿來重放的完整資料）。`app/db.py` 整個模組刻意**沒有寫任何 UPDATE 或 DELETE**，要修正只能新增一筆新紀錄，舊的永遠留著——這點有測試直接驗證（`test_no_update_or_delete_functions_exist`）。
+- **每個動作都是一筆不可變、有時間戳記、只能新增不能修改的紀錄**：`audit_log` 表。**所有**分析/優化端點都已掛勾（2026-07-22 補齊）：`/upload`、`/analyze/measurement`、`/analyze/structural`、`/analyze/seminr`、`/analyze/full`、`/analyze/efa`、`/analyze/deleted-alpha`、`/analyze/data-quality`、`/analyze/composite`、`/analyze/llm-suggestions`、`/optimize/measurement`、`/optimize/path`、`/optimize/full-search`，欄位包含完整的 request 參數跟 result 內容（不是摘要，是真的可以拿來重放的完整資料）。`app/db.py` 整個模組刻意**沒有寫任何 UPDATE 或 DELETE**，要修正只能新增一筆新紀錄，舊的永遠留著——這點有測試直接驗證（`test_no_update_or_delete_functions_exist`）。
+  - 補記：跑一輪端到端 pipeline 驗證時發現 `/analyze/seminr` 當初雖然掛了 L2 關卡，卻沒掛審計紀錄，跟姊妹端點 `/analyze/structural` 不對稱——已修正並補了 `test_all_non_r_analysis_endpoints_are_audited` 這種「跑一輪所有端點、檢查審計紀錄裡的 action 集合完整」的測試，避免同類疏漏再發生。
+  - `/analyze/full` 原本也沒有 L2 關卡（它跟 `/analyze/structural` 一樣會跑結構模型分析），這次一併補上。
 - **以「研究 × 資料版本 × 分析執行」為主鍵**：`declarations`（研究/理論宣告，對應 L0）→ `datasets`（資料版本，用 SHA-256 內容雜湊避免同一份資料被誤判成不同版本，反之亦然）→ `audit_log`（分析執行，透過 `dataset_id`/`declaration_id` 外鍵串起前兩者）。`GET /audit/history`、`GET /audit/{id}` 可以查詢，且有做基本存取控制（只能看自己 user_id 底下的紀錄）。
 - ~~現有系統的 `SESSION: Dict = {}` 是全域單一變數，兩個人同時用會互相覆蓋資料~~ 已解決：`app/session_store.py` 依 API token / `x-session-id` 分開存，多使用者不會再互相覆蓋——這部分維持原樣，是「目前 session 快照」用途，跟這裡的 `audit_log`（完整歷史）是兩個不同、互補的機制，不是同一件事的兩種寫法。
 

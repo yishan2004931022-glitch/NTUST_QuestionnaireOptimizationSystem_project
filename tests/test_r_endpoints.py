@@ -110,6 +110,9 @@ class TestEFAEndpoint:
         assert "par_suggest" in data
         assert "efa_factors" in data
 
+        history = client.get("/audit/history").json()["entries"]
+        assert any(e["action"] == "analyze_efa" for e in history)
+
     @pytest.mark.skipif(r_not_available, reason="Rscript not installed locally")
     def test_efa_requires_data(self):
         r = _make_client().post("/analyze/efa", json={"max_factors": 2})
@@ -217,3 +220,28 @@ class TestSeminrEndpoint:
         })
         assert r.status_code == 403
         assert "Noise" in r.json()["detail"]
+
+    @pytest.mark.skipif(r_not_available, reason="Rscript not installed locally")
+    def test_seminr_is_audited(self, synthetic_df, construct_dict, structural_model):
+        _inject_session(synthetic_df, construct_dict)
+        client = TestClient(app)
+        client.post("/analyze/seminr", json={
+            "measurement": construct_dict, "structural": structural_model, "bootstrap": 50,
+        })
+        history = client.get("/audit/history").json()["entries"]
+        assert any(e["action"] == "analyze_seminr" for e in history)
+
+
+class TestPlsCompositeScoreEndpoint:
+    @pytest.mark.skipif(r_not_available, reason="Rscript not installed locally")
+    def test_pls_composite_is_audited(self, synthetic_df, construct_dict, structural_model):
+        _inject_session(synthetic_df, construct_dict)
+        client = TestClient(app)
+        r = client.post("/analyze/composite", json={
+            "weighting": "pls", "structural_model": structural_model, "bootstrap": 30,
+        })
+        assert r.status_code == 200
+        history = client.get("/audit/history").json()["entries"]
+        composite_entries = [e for e in history if e["action"] == "analyze_composite"]
+        assert len(composite_entries) == 1
+        assert composite_entries[0]["request_params"]["weighting"] == "pls"

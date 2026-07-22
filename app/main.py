@@ -448,7 +448,7 @@ async def analyze_measurement(request: Request, body: OptimizeMeasurementInput):
             "freq": {col: df[col].value_counts().sort_index().round(4).to_dict() for col in items},
         }
 
-    return {
+    response = {
         "reliability": reliability,
         "convergent_validity": convergent,
         "cross_loadings": cross,
@@ -467,6 +467,14 @@ async def analyze_measurement(request: Request, body: OptimizeMeasurementInput):
             "health_score": round((passed + alpha_passed) / (total_latent * 2) * 100, 1) if total_latent else 0.0,
         },
     }
+    audit_db.log_action(
+        _resolve_user_id(request), "analyze_measurement",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"construct_dict": construct_dict},
+        result_summary=response,
+        is_exploratory=False,
+    )
+    return response
 
 
 def _llm_prompt_template(construct_dict, convergent, reverse_flags, low_loading_flags, item_stems):
@@ -754,6 +762,13 @@ async def analyze_llm_suggestions(request: Request, body: LLMInput):
     except Exception:
         pass
 
+    audit_db.log_action(
+        _resolve_user_id(request), "analyze_llm_suggestions",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"action": body.action, "target_items": body.target_items, "provider": provider or None},
+        result_summary=result,
+        is_exploratory=False,
+    )
     return result
 
 
@@ -962,6 +977,13 @@ async def analyze_data_quality(request: Request, body: DataQualityInput):
             time_column=body.time_column,
             min_signals=body.min_signals or 2,
         )
+        audit_db.log_action(
+            _resolve_user_id(request), "analyze_data_quality",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"time_column": body.time_column, "min_signals": body.min_signals},
+            result_summary=result,
+            is_exploratory=False,
+        )
         return {"success": True, **result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"資料品質診斷失敗：{e}")
@@ -1011,6 +1033,8 @@ async def analyze_full(request: Request, body: StructuralModelInput):
     alpha_passed = sum(1 for v in reliability.values() if v.get("alpha") and v["alpha"] >= 0.7)
     overall_status = "attention" if low_loading_flags else ("pass" if total_latent and passed == total_latent and alpha_passed == total_latent else "review")
 
+    _enforce_l2_gate(df, latent_constructs, body.override_l2_gate, body.override_reason, request, session, "analyze_full")
+
     try:
         bootstrapping = calc_bootstrapping(df, latent_constructs, body.structural_model, body.boot_iterations)
         vif = calc_vif(df, latent_constructs, body.structural_model)
@@ -1019,7 +1043,7 @@ async def analyze_full(request: Request, body: StructuralModelInput):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"結構模型分析失敗：{e}")
 
-    return {
+    response = {
         "measurement": {
             "status": overall_status,
             "reliability": reliability,
@@ -1047,19 +1071,36 @@ async def analyze_full(request: Request, body: StructuralModelInput):
             },
         },
     }
+    audit_db.log_action(
+        _resolve_user_id(request), "analyze_full",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"structural_model": body.structural_model, "boot_iterations": body.boot_iterations},
+        result_summary=response,
+        is_exploratory=False,
+    )
+    return response
 
 
 # ─── Stage 1: EFA / Parallel Analysis (R bridge) ────────────────
 
 @app.post("/analyze/efa")
 async def analyze_efa(request: Request, body: EfaInput):
-    df = _get_user_session(request).get("df")
+    session = _get_user_session(request)
+    df = session.get("df")
     if df is None:
         raise HTTPException(status_code=400, detail="請先上傳資料檔案")
 
     try:
         result = run_efa(df, max_factors=body.max_factors or 10)
-        return {"success": True, **result}
+        response = {"success": True, **result}
+        audit_db.log_action(
+            _resolve_user_id(request), "analyze_efa",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"max_factors": body.max_factors},
+            result_summary=response,
+            is_exploratory=False,
+        )
+        return response
     except RBridgeError as e:
         raise HTTPException(status_code=500, detail=f"EFA 分析失敗：{str(e)}")
     except Exception:
@@ -1070,7 +1111,8 @@ async def analyze_efa(request: Request, body: EfaInput):
 
 @app.post("/analyze/deleted-alpha")
 async def analyze_deleted_alpha(request: Request, body: DeletedAlphaInput):
-    df = _get_user_session(request).get("df")
+    session = _get_user_session(request)
+    df = session.get("df")
     if df is None:
         raise HTTPException(status_code=400, detail="請先上傳資料檔案")
 
@@ -1082,7 +1124,15 @@ async def analyze_deleted_alpha(request: Request, body: DeletedAlphaInput):
         raise HTTPException(status_code=400, detail=f"資料檔找不到題項：{missing}")
 
     try:
-        return calc_deleted_alpha(df, body.items)
+        result = calc_deleted_alpha(df, body.items)
+        audit_db.log_action(
+            _resolve_user_id(request), "analyze_deleted_alpha",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"items": body.items},
+            result_summary=result,
+            is_exploratory=False,
+        )
+        return result
     except Exception:
         raise HTTPException(status_code=500, detail="Deleted Alpha 計算失敗")
 
@@ -1114,7 +1164,15 @@ async def analyze_seminr(request: Request, body: SeminrInput):
             structural=structural,
             bootstrap=body.bootstrap or 200,
         )
-        return {"success": True, **result}
+        response = {"success": True, **result}
+        audit_db.log_action(
+            _resolve_user_id(request), "analyze_seminr",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"measurement": measurement, "structural": structural, "bootstrap": body.bootstrap},
+            result_summary=response,
+            is_exploratory=False,
+        )
+        return response
     except RBridgeError as e:
         raise HTTPException(status_code=500, detail=f"seminr 分析失敗：{str(e)}")
     except Exception:
@@ -1123,11 +1181,12 @@ async def analyze_seminr(request: Request, body: SeminrInput):
 
 @app.post("/analyze/composite")
 async def analyze_composite(request: Request, body: CompositeInput):
-    df = _get_user_session(request).get("df")
+    session = _get_user_session(request)
+    df = session.get("df")
     if df is None:
         raise HTTPException(status_code=400, detail="請先上傳資料檔案")
 
-    construct_dict = body.construct_dict or _get_user_session(request).get("construct_dict", {})
+    construct_dict = body.construct_dict or session.get("construct_dict", {})
     if not construct_dict:
         raise HTTPException(status_code=400, detail="請提供 construct_dict")
 
@@ -1144,7 +1203,7 @@ async def analyze_composite(request: Request, body: CompositeInput):
         except RBridgeError as e:
             raise HTTPException(status_code=500, detail=f"PLS composite score 計算失敗：{e}")
         scores = seminr_result.get("composite_scores", {})
-        return {
+        response = {
             construct: {
                 "score": round(sum(vals) / len(vals), 4) if vals else None,
                 "method": "pls-weighted",
@@ -1153,9 +1212,25 @@ async def analyze_composite(request: Request, body: CompositeInput):
             }
             for construct, vals in scores.items()
         }
+        audit_db.log_action(
+            _resolve_user_id(request), "analyze_composite",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"weighting": weighting, "structural_model": body.structural_model},
+            result_summary=response,
+            is_exploratory=False,
+        )
+        return response
 
     try:
-        return calc_composite_score(df, construct_dict, weighting=weighting)
+        result = calc_composite_score(df, construct_dict, weighting=weighting)
+        audit_db.log_action(
+            _resolve_user_id(request), "analyze_composite",
+            dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+            request_params={"weighting": weighting},
+            result_summary=result,
+            is_exploratory=False,
+        )
+        return result
     except Exception:
         raise HTTPException(status_code=500, detail="Composite Score 計算失敗")
 

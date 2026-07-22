@@ -954,6 +954,36 @@ class TestDeclarationAndAuditEndpoints:
         assert by_action["analyze_structural"]["is_exploratory"] is False
         assert by_action["optimize_full_search"]["is_exploratory"] is True
 
+    def test_all_non_r_analysis_endpoints_are_audited(self, synthetic_df, construct_dict, structural_model):
+        # Every analysis-producing endpoint must leave a trace -- this was a
+        # real gap found during a full pipeline walkthrough: /analyze/seminr
+        # had the L2 gate wired but no audit_db.log_action() call, unlike
+        # its sibling /analyze/structural. Covers every endpoint here that
+        # doesn't require Rscript (those are covered separately in
+        # tests/test_r_endpoints.py).
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        client.post("/analyze/data-quality", json={})
+        client.post("/analyze/measurement", json={})
+        client.post("/analyze/deleted-alpha", json={"items": construct_dict["TR"]})
+        client.post("/optimize/measurement", json={})
+        client.post("/analyze/structural", json={"structural_model": {"PE": ["TR"]}})
+        client.post("/optimize/full-search", json={"structural_model": structural_model, "boot_iterations": 50})
+        client.post("/analyze/composite", json={"weighting": "loading"})
+        client.post("/analyze/llm-suggestions", json={"action": "optimize_items"})
+
+        history = client.get("/audit/history").json()["entries"]
+        actions_logged = {e["action"] for e in history}
+        assert actions_logged == {
+            "upload", "analyze_data_quality", "analyze_measurement", "analyze_deleted_alpha",
+            "optimize_measurement", "analyze_structural", "optimize_full_search",
+            "analyze_composite", "analyze_llm_suggestions",
+        }
+        # Every entry from this session must share the same dataset -- no
+        # action should silently attach to the wrong dataset_id.
+        dataset_ids = {e["dataset_id"] for e in history}
+        assert len(dataset_ids) == 1
+
     def test_audit_entry_not_visible_to_other_user(self, synthetic_df, construct_dict):
         client_a = _make_client()
         _upload_synthetic(client_a, synthetic_df)
@@ -969,3 +999,23 @@ class TestDeclarationAndAuditEndpoints:
         r = client.get("/audit/history")
         assert r.status_code == 200
         assert r.json()["entries"] == []
+
+    def test_analyze_full_is_l2_gated_and_audited(self):
+        df = TestL2Gate()._bad_and_good_df()
+        client = _make_client()
+        _upload_synthetic(client, df)
+
+        blocked = client.post("/analyze/full", json={
+            "structural_model": {"G": ["N"]},
+            "construct_dict": {"G": ["G1", "G2", "G3"], "N": ["N1", "N2", "N3"]},
+        })
+        assert blocked.status_code == 403
+
+        ok = client.post("/analyze/full", json={
+            "structural_model": {"G": []},
+            "construct_dict": {"G": ["G1", "G2", "G3"]},
+        })
+        assert ok.status_code == 200
+
+        history = client.get("/audit/history").json()["entries"]
+        assert any(e["action"] == "analyze_full" for e in history)
