@@ -30,6 +30,7 @@ from app.stats_engine import (
     calc_r_squared,
     optimize_measurement,
     optimize_structural_path,
+    optimize_unified,
     calc_deleted_alpha,
     calc_composite_score,
     calc_reverse_item_flags,
@@ -266,6 +267,13 @@ class OptimizePathInput(BaseModel):
 
 class OptimizeMeasurementInput(BaseModel):
     construct_dict: Optional[Dict[str, List[str]]] = None
+
+
+class OptimizeFullSearchInput(BaseModel):
+    structural_model: Dict[str, List[str]]
+    construct_dict: Optional[Dict[str, List[str]]] = None
+    max_drop_ratio: Optional[float] = 0.10
+    boot_iterations: Optional[int] = 300
 
 
 class EfaInput(BaseModel):
@@ -791,6 +799,36 @@ async def optimize_path_endpoint(request: Request, body: OptimizePathInput):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"結構路徑最佳化失敗：{e}")
+
+
+# ─── Optimization Engine — Unified (Stage A gate → per-path Stage B) ──
+
+@app.post("/optimize/full-search")
+async def optimize_full_search(request: Request, body: OptimizeFullSearchInput):
+    session = _get_user_session(request)
+    df = session.get("df")
+    if df is None:
+        raise HTTPException(status_code=400, detail="請先上傳資料檔案")
+
+    construct_dict = body.construct_dict or session.get("construct_dict", {})
+    if not construct_dict:
+        raise HTTPException(status_code=400, detail="請提供 construct_dict")
+    if not body.structural_model:
+        raise HTTPException(status_code=400, detail="請提供 structural_model")
+
+    try:
+        result = optimize_unified(
+            df=df,
+            construct_dict=construct_dict,
+            structural_model=body.structural_model,
+            max_drop_ratio=body.max_drop_ratio or 0.10,
+            boot_iterations=body.boot_iterations or 300,
+        )
+        session["optimized_construct_dict"] = result["stage_a"]["optimized_construct_dict"]
+        save_session(session.get("df"), session.get("construct_dict", {}), result["stage_a"]["optimized_construct_dict"], request=request)
+        return {"success": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"統一最佳化引擎執行失敗：{e}")
 
 
 # ─── Full Pipeline (convenience endpoint) ────────────────────────
