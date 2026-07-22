@@ -100,12 +100,12 @@ Simmons, Nelson & Simonsohn (2011) 證明：不揭露的研究者自由度（要
 
 由上而下是資料實際流動的方向；**L2 是硬性關卡**，**L4 的每一筆輸出都帶著「exploratory」標籤**，**L5 貫穿全部層級做版本追蹤**。每層都標註了跟現有程式碼的對應狀態。
 
-### L0 · 研究設計宣告層 — 現有系統完全沒有
+### L0 · 研究設計宣告層 — ✅ 已完成（2026-07-22），語法用純 JSON 而非 lavaan 風格
 
-上傳資料之前，研究者先用宣告式語法定義構面、題項、假設路徑（借用 `lavaan` 的 `=~` 測量 / `~` 結構 / `~~` 共變 語法概念），存成獨立於資料的「理論規格」，並蓋上時間戳記。
+上傳資料之前，研究者先呼叫 `POST /declare`（`app/db.py` `create_declaration()`）宣告構面、題項、假設路徑，存成獨立於資料的「理論規格」，並蓋上時間戳記。
 
-- 把「理論」跟「資料」拆成兩個獨立、各自版控的物件——現有系統把 `structural_model` 當成每次 API 呼叫才帶的臨時參數，理論本身沒有被存下來、追蹤版本。
-- 這個時間戳記就是 confirmatory／exploratory 的分界線：宣告之後才做的任何「目標路徑搜尋」都自動歸類為事後分析。
+- 「理論」跟「資料」已拆成兩個獨立、各自有主鍵的物件——`declarations` 表存理論規格，`datasets` 表存每次上傳（見下方 L5），`datasets.declaration_id` 把兩者串起來。跟原始設計唯一的差異是**沒有照搬 `lavaan` 的 `=~`/`~`/`~~` 語法**，改用跟系統其他端點一致的純 JSON（`measurement_model` / `structural_model`），理由是這個系統本來就是 JSON API，硬套 lavaan 的字串語法只會多一層解析成本，不會多帶來任何好處。
+- 這個時間戳記就是 confirmatory／exploratory 的分界線：`GET /declare/{id}` 可查回原始宣告與時間點，`POST /optimize/path`、`POST /optimize/full-search`（L4 的搜尋端點）在審計紀錄裡固定被標記 `is_exploratory: true`，不管宣告內容寫什麼——這是寫死的規則，不是靠比對宣告內容跟搜尋路徑是否一致這種模糊判斷（那種語意比對留給研究者自己看，不是系統能可靠自動判斷的事）。
 
 ### L1 · 資料品質層 — ✅ 多訊號偵測 + Stage B 強制掛勾已完成（2026-07-22）
 
@@ -144,13 +144,13 @@ Phase 2 已完成：`optimize_unified()`（`app/stats_engine.py`）+ `POST /opti
 - 每次搜尋結果目前是單次回應，不是「不可變的情境記錄」，沒有版本化、沒辦法事後並排比較多個情境。
 - 回應目前沒有固定帶 EXPLORATORY 標籤欄位，前端／使用這個端點的人要自己記得這件事——L1 訊號能不能百分之百排除誤判，仍然是統計推論不是保證，這個端點的輸出仍然應該當成 exploratory 看待，只是現在多了一層實質理由把關，不是毫無防備的純統計搜尋。
 
-### L5 · 審計與版本層 — 🟡 多使用者隔離已解決，正式版控/審計仍未做
+### L5 · 審計與版本層 — ✅ 已完成（2026-07-22）
 
-不是流程裡的一個步驟，而是所有層共用的底層機制——概念上借用 DVC / MLflow 的 provenance 模式。
+不是流程裡的一個步驟，而是所有層共用的底層機制——概念上借用 DVC / MLflow 的 provenance 模式，實作上是 SQLite（`app/db.py`，理由見第八節 8.3 一貫的「先求堪用、之後真的要上正式環境再換 Postgres」原則）。
 
-- 每個動作（上傳、L2 純化、L4 情境）都是一筆不可變、有時間戳記、只能新增不能修改的紀錄——**尚未實作**。
-- 用真正的資料庫（不是現有系統的全域記憶體 dict）保存，以「研究 × 資料版本 × 分析執行」為主鍵，讓口試委員可以完整重放從原始資料到最終數字的每一步——**尚未實作**。
-- ~~現有系統的 `SESSION: Dict = {}` 是全域單一變數，兩個人同時用會互相覆蓋資料~~ 已解決：`app/session_store.py` 依 API token / `x-session-id` 分開存（記憶體 dict 依 key 分流 + 落地成每人一份 JSON 檔），多使用者不會再互相覆蓋。但這是檔案存放，不是正式資料庫，也還沒有不可變審計紀錄——Phase 4 的完整版本仍未開始。
+- **每個動作都是一筆不可變、有時間戳記、只能新增不能修改的紀錄**：`audit_log` 表，每次 `/upload`、`/analyze/structural`、`/optimize/measurement`、`/optimize/path`、`/optimize/full-search` 執行完都會寫入一筆，欄位包含完整的 request 參數跟 result 內容（不是摘要，是真的可以拿來重放的完整資料）。`app/db.py` 整個模組刻意**沒有寫任何 UPDATE 或 DELETE**，要修正只能新增一筆新紀錄，舊的永遠留著——這點有測試直接驗證（`test_no_update_or_delete_functions_exist`）。
+- **以「研究 × 資料版本 × 分析執行」為主鍵**：`declarations`（研究/理論宣告，對應 L0）→ `datasets`（資料版本，用 SHA-256 內容雜湊避免同一份資料被誤判成不同版本，反之亦然）→ `audit_log`（分析執行，透過 `dataset_id`/`declaration_id` 外鍵串起前兩者）。`GET /audit/history`、`GET /audit/{id}` 可以查詢，且有做基本存取控制（只能看自己 user_id 底下的紀錄）。
+- ~~現有系統的 `SESSION: Dict = {}` 是全域單一變數，兩個人同時用會互相覆蓋資料~~ 已解決：`app/session_store.py` 依 API token / `x-session-id` 分開存，多使用者不會再互相覆蓋——這部分維持原樣，是「目前 session 快照」用途，跟這裡的 `audit_log`（完整歷史）是兩個不同、互補的機制，不是同一件事的兩種寫法。
 
 ### L6 · 呈現層 — 現有系統完全沒有前端
 
@@ -201,11 +201,11 @@ Phase 2 已完成：`optimize_unified()`（`app/stats_engine.py`）+ `POST /opti
 
 **為什麼排第四**：這一步把 Phase 2 的 MVP 從「單純統計驅動」補強成「統計 + 實質理由雙重驗證」，是能不能在論文方法章節站得住腳的關鍵，但屬於「讓已存在的功能更嚴謹」而非「做出新功能」，所以排在核心功能之後。
 
-### Phase 4 · 宣告層 + 完整版控儲存（對應 L0 + 完整版 L5）
+### Phase 4 · 宣告層 + 完整版控儲存（對應 L0 + 完整版 L5）— ✅ 已完成（2026-07-22）
 
-**目標**：從記憶體 dict 全面換成持久化資料庫；加入宣告式假設規格（L0，含時間戳記）；建立完整的不可變審計紀錄（每個操作可重放）。
+**目標**：從記憶體 dict 全面換成持久化資料庫；加入宣告式假設規格（L0，含時間戳記）；建立完整的不可變審計紀錄（每個操作可重放）。已完成，詳見第四節 L0、L5。資料庫選用 SQLite（`app/db.py`），`POST /declare` 建立宣告、`GET /audit/history`／`GET /audit/{id}` 查詢審計紀錄，`/upload`、`/analyze/structural`、`/optimize/measurement`、`/optimize/path`、`/optimize/full-search` 都已掛上稽核紀錄，L4 的兩個搜尋端點固定標記 `is_exploratory: true`。10 個新測試涵蓋宣告建立/查詢、資料集內容雜湊（同內容同雜湊、不同內容不同雜湊）、審計紀錄查詢與存取控制、confirmatory/exploratory 標記正確性，以及「模組裡沒有任何 UPDATE/DELETE 函數」這個不可變性的直接驗證。
 
-**為什麼排第五**：工程量最大的一塊（要設計 schema、選資料庫、寫遷移），最好等 Phase 0–3 把「系統實際需要存哪些物件」摸清楚以後再一次做對，不然現在做會因為前面需求還沒定型而重工。
+**為什麼原本排第五（現在補記）**：工程量最大的一塊（要設計 schema、選資料庫、寫遷移），等 Phase 0–3 做完再動手，果然沒有重工——`audit_log` 表的欄位設計（`dataset_id`/`declaration_id`/`is_exploratory`）直接對應到 Phase 0-3 已經穩定下來的資料流，沒有中途改過 schema。
 
 ### Phase 5 · 呈現層（對應 L6）
 
