@@ -144,7 +144,38 @@ class TestSeminrEndpoint:
         })
         assert r.status_code == 200
         data = r.json()
-        assert "suggested_new_items" in data or "loadings" in data or "success" in data
+        assert data["success"] is True
+        assert not data.get("error")
+
+        # Reliability / measurement model
+        assert set(data["reliability"].keys()) == {"Trust", "Performance"}
+        for construct_stats in data["reliability"].values():
+            assert 0 <= construct_stats["ave"] <= 1
+            assert 0 <= construct_stats["composite_reliability"] <= 1
+
+        # HTMT: only one pair for a 2-construct model, value must be a valid correlation-like ratio
+        htmt = data["validity"]["htmt"]
+        htmt_values = [v for row in htmt.values() for v in row.values()]
+        assert len(htmt_values) == 1
+        assert 0 <= htmt_values[0] <= 2  # HTMT can exceed 1 for poorly-discriminated constructs
+
+        # Path significance: bootstrap p-value must be internally consistent with the t-stat
+        path = data["paths"]["Trust  ->  Performance"]
+        assert path["p_value"] is not None
+        if abs(path["t_stat"]) > 2.6:  # ~p<0.01 two-tailed threshold
+            assert path["p_value"] < 0.05
+
+        # R-squared for the single dependent construct
+        assert 0 <= data["r_squared"]["Performance"]["r_squared"] <= 1
+
+        # f-squared effect size for the single path
+        assert data["f_squared"]["Trust"]["Performance"] >= 0
+
+        # Q2predict / PLSpredict: only the endogenous construct's items get out-of-sample predictions
+        assert set(data["predictive"].keys()) == set(construct_dict["Performance"])
+        for stats in data["predictive"].values():
+            assert stats["rmse_pls"] > 0
+            assert stats["rmse_lm_benchmark"] > 0
 
     @pytest.mark.skipif(r_not_available, reason="Rscript not installed locally")
     def test_seminr_no_data(self):
