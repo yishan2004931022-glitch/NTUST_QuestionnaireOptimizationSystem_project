@@ -283,6 +283,7 @@ class OptimizeFullSearchInput(BaseModel):
     require_data_quality_flag: Optional[bool] = True
     time_column: Optional[str] = None
     min_signals: Optional[int] = 2
+    label: Optional[str] = None
 
 
 class DataQualityInput(BaseModel):
@@ -779,7 +780,14 @@ async def analyze_llm_suggestions(request: Request, body: LLMInput):
 # validated, unless a human explicitly overrides with a logged reason.
 
 def _check_l2_gate(df, construct_dict: Dict[str, List[str]]):
-    result = optimize_measurement(df, construct_dict)
+    # Single-item entries (typically demographic/control columns picked up
+    # by auto-detection, e.g. "Gender": ["Gender"]) are not latent PLS-SEM
+    # constructs and were never meant to be held to an AVE/reliability
+    # standard -- checking them here would block analysis on variables the
+    # measurement model was never supposed to cover. /analyze/measurement
+    # already excludes them the same way; this keeps the two consistent.
+    latent_constructs = {c: items for c, items in construct_dict.items() if len(items) >= 2}
+    result = optimize_measurement(df, latent_constructs)
     blocked = [e["construct"] for e in result["log"] if e["action"] in ("⚠️ 無可救藥", "❌ 計算錯誤")]
     return len(blocked) == 0, blocked
 
@@ -948,14 +956,20 @@ async def optimize_full_search(request: Request, body: OptimizeFullSearchInput):
         )
         session["optimized_construct_dict"] = result["stage_a"]["optimized_construct_dict"]
         save_session(session.get("df"), session.get("construct_dict", {}), result["stage_a"]["optimized_construct_dict"], request=request)
-        audit_db.log_action(
+        entry_id = audit_db.log_action(
             _resolve_user_id(request), "optimize_full_search",
             dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
-            request_params={"structural_model": body.structural_model, "max_drop_ratio": body.max_drop_ratio},
+            request_params={
+                "label": body.label,
+                "structural_model": body.structural_model,
+                "max_drop_ratio": body.max_drop_ratio,
+                "boot_iterations": body.boot_iterations,
+                "require_data_quality_flag": body.require_data_quality_flag,
+            },
             result_summary=result,
             is_exploratory=True,
         )
-        return {"success": True, **result}
+        return {"success": True, "audit_entry_id": entry_id, **result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"統一最佳化引擎執行失敗：{e}")
 

@@ -2,7 +2,7 @@
 """L2/L3: reliability, convergent/discriminant validity, path significance."""
 import streamlit as st
 
-from api_client import has_uploaded_data, is_error, post_json, show_error
+from api_client import has_uploaded_data, is_error, parse_line_dict, post_json, show_error
 
 st.set_page_config(page_title="測量／結構診斷 | Survey Co-Pilot", page_icon="📊", layout="wide")
 st.title("📊 測量／結構模型診斷（L2 / L3）")
@@ -55,8 +55,12 @@ if st.session_state.get("declared_structural_model"):
     default_structural = "\n".join(f"{dep}: {', '.join(indeps)}" for dep, indeps in st.session_state["declared_structural_model"].items())
 
 structural_text = st.text_area(
-    "結構模型（每行：`依變數: 自變數1, 自變數2`）", value=default_structural, height=100,
+    "結構模型（每行：`依變數: 自變數1, 自變數2`；同一個依變數可以分好幾行寫，會自動合併，不會互相覆蓋）",
+    value=default_structural, height=100,
 )
+if structural_text.strip():
+    with st.expander("目前輸入解析出來的結構模型（送出前先確認）"):
+        st.json(parse_line_dict(structural_text))
 
 use_seminr = st.checkbox("用 R/seminr 算完整版（含 HTMT、f²、Q²predict，較慢）", value=False)
 
@@ -66,20 +70,8 @@ if override:
     override_reason = st.text_input("override 理由（必填，會寫進審計紀錄）")
 
 
-def _parse_structural(text: str) -> dict:
-    result = {}
-    for line in text.strip().splitlines():
-        if ":" not in line:
-            continue
-        dep, indeps = line.split(":", 1)
-        items = [v.strip() for v in indeps.split(",") if v.strip()]
-        if items:
-            result[dep.strip()] = items
-    return result
-
-
 if st.button("執行結構模型分析", type="primary"):
-    structural_model = _parse_structural(structural_text)
+    structural_model = parse_line_dict(structural_text)
     if not structural_model:
         st.warning("請至少填寫一條結構路徑。")
     else:

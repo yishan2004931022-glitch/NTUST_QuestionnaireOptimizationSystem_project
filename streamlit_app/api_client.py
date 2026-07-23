@@ -10,13 +10,41 @@ _resolve_user_id).
 """
 import os
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 import streamlit as st
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.environ.get("API_KEY", "")
+
+
+def parse_line_dict(text: str) -> Dict[str, List[str]]:
+    """
+    Parse "key: val1, val2" lines into {key: [val1, val2, ...]}.
+
+    If the same key appears on more than one line (e.g. a dependent
+    variable with a long list of antecedents split across lines for
+    readability), the values are MERGED, not overwritten -- a plain
+    `result[key] = items` here would silently drop every line but the
+    last for that key, which is exactly the kind of bug that produces a
+    structural model with fewer paths than the user actually typed.
+    """
+    result: Dict[str, List[str]] = {}
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, vals = line.split(":", 1)
+        key = key.strip()
+        items = [v.strip() for v in vals.split(",") if v.strip()]
+        if not items:
+            continue
+        existing = result.setdefault(key, [])
+        for item in items:
+            if item not in existing:
+                existing.append(item)
+    return result
 
 
 def session_id() -> str:
