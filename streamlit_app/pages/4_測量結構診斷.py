@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """L2/L3: reliability, convergent/discriminant validity, path significance."""
+import pandas as pd
 import streamlit as st
 
 from api_client import has_uploaded_data, is_error, parse_line_dict, post_json, show_error
@@ -12,6 +13,70 @@ if not has_uploaded_data():
     st.stop()
 
 construct_dict = st.session_state.get("construct_dict", {})
+
+
+# ── Shared threshold helpers (same thresholds documented in PROFESSOR_REPORT.md 2.5) ──
+
+def _status(ok: bool) -> str:
+    return "🟢 通過" if ok else "🔴 未達標"
+
+
+def _r2_level(r2):
+    if r2 is None:
+        return "—"
+    if r2 >= 0.75:
+        return "🟢 強 (Strong)"
+    if r2 >= 0.5:
+        return "🟢 中 (Moderate)"
+    if r2 >= 0.25:
+        return "🟡 弱 (Weak)"
+    return "🔴 極弱 (Very Weak)"
+
+
+def _f2_level(f2):
+    if f2 is None:
+        return "—"
+    if f2 >= 0.35:
+        return "🟢 大 (Large)"
+    if f2 >= 0.15:
+        return "🟡 中 (Medium)"
+    if f2 >= 0.02:
+        return "🟡 小 (Small)"
+    return "⚪ 可忽略 (Negligible)"
+
+
+def _htmt_status(v):
+    if v is None:
+        return "—"
+    if v < 0.85:
+        return "🟢 通過（嚴格 0.85）"
+    if v < 0.90:
+        return "🟡 僅寬鬆通過（<0.90，嚴格 0.85 未過）"
+    return "🔴 未通過（≥0.90，區辨效度有疑慮）"
+
+
+def _vif_status(v):
+    if v is None:
+        return "—"
+    if v < 3:
+        return "🟢 優良"
+    if v < 5:
+        return "🟡 可接受"
+    return "🔴 共線性問題"
+
+
+def _q2_status(v):
+    if v is None:
+        return "—"
+    return "🟢 有預測力 (Q²>0)" if v > 0 else "🔴 無預測力 (Q²≤0)"
+
+
+def _show_table(rows):
+    if not rows:
+        st.caption("（沒有資料）")
+        return
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
 # ── L2: Measurement model ──────────────────────────────────────────
 st.header("測量模型（L2）")
@@ -32,19 +97,31 @@ if "measurement_result" in st.session_state:
     cols[2].metric("α 過關", f"{summary['alpha_passed']}/{summary['latent_constructs']}")
     cols[3].metric("整體健康分數", f"{summary['health_score']}%")
 
-    st.subheader("逐構面信效度")
+    st.subheader("逐構面信效度總覽")
+    rows = []
     for construct, rel in m["reliability"].items():
         conv = m["convergent_validity"].get(construct, {})
-        status_icon = "🟢" if rel.get("status", "").startswith("🟢") and conv.get("AVE_status", "").startswith("🟢") else "🔴"
-        with st.expander(f"{status_icon} {construct} — α={rel.get('alpha')}　AVE={conv.get('AVE')}　CR={conv.get('CR')}"):
-            c1, c2 = st.columns(2)
-            c1.write(f"Cronbach's α：{rel.get('alpha')}（{rel.get('status')}）")
-            c1.write(f"AVE：{conv.get('AVE')}（{conv.get('AVE_status')}）")
-            c2.write(f"CR：{conv.get('CR')}（{conv.get('CR_status')}）")
-            st.write("Loadings：", conv.get("loadings"))
+        rows.append({
+            "構面": construct,
+            "α": rel.get("alpha"),
+            "α 狀態": rel.get("status", "—"),
+            "AVE": conv.get("AVE"),
+            "AVE 狀態": conv.get("AVE_status", "—"),
+            "CR": conv.get("CR"),
+            "CR 狀態": conv.get("CR_status", "—"),
+        })
+    _show_table(rows)
 
     if m.get("low_loading_flags"):
-        st.warning("低 loading 題項：" + "；".join(f"{f['construct']}: {', '.join(f['items'])}" for f in m["low_loading_flags"]))
+        st.warning("低 loading 題項（<0.7）：" + "；".join(f"{f['construct']}: {', '.join(f['items'])}" for f in m["low_loading_flags"]))
+
+    with st.expander("查看每個構面的題項 loading 明細"):
+        for construct, conv in m["convergent_validity"].items():
+            loadings = conv.get("loadings", {})
+            if not loadings:
+                continue
+            st.caption(construct)
+            _show_table([{"題項": k, "Loading": v, "狀態": "🟢" if v >= 0.7 else "🔴 <0.7"} for k, v in loadings.items()])
 
 st.divider()
 
@@ -103,25 +180,102 @@ if st.button("執行結構模型分析", type="primary"):
 
 if "structural_result" in st.session_state:
     s = st.session_state["structural_result"]
+
     if st.session_state.get("structural_used_seminr"):
+        st.caption("以下是 R/seminr 完整引擎算出來的「定案」數字，跟上方 L2（Python 近似引擎）不是同一套算法，數字不會完全一樣，細節見 PROFESSOR_REPORT.md 2.4。")
+
         st.subheader("路徑顯著性")
-        for path, stats in s.get("paths", {}).items():
-            icon = "🟢" if stats.get("p_value", 1) < 0.05 else "🔴"
-            st.write(f"{icon} {path}：β={stats['beta']}, t={stats['t_stat']}, p={stats['p_value']}")
-        st.subheader("R²")
-        st.json(s.get("r_squared", {}))
+        rows = [
+            {
+                "路徑": path, "β": v.get("beta"), "t": v.get("t_stat"), "p": v.get("p_value"),
+                "95% CI": f"[{v.get('ci_2_5')}, {v.get('ci_97_5')}]",
+                "顯著性": "🟢 顯著" if (v.get("p_value") or 1) < 0.05 else "🔴 不顯著",
+            }
+            for path, v in s.get("paths", {}).items()
+        ]
+        _show_table(rows)
+
+        seminr_reliability = s.get("reliability", {})
+        if seminr_reliability:
+            st.subheader("R/seminr 版測量模型指標（信度／收斂效度）")
+            rows = []
+            for construct, r in seminr_reliability.items():
+                alpha, cr, ave = r.get("cronbach_alpha"), r.get("composite_reliability"), r.get("ave")
+                rows.append({
+                    "構面": construct,
+                    "α": alpha, "α 狀態": _status(alpha is not None and alpha >= 0.7),
+                    "ρA": r.get("rho_a"),
+                    "CR (ρC)": cr, "CR 狀態": _status(cr is not None and cr >= 0.7),
+                    "AVE": ave, "AVE 狀態": _status(ave is not None and ave >= 0.5),
+                })
+            _show_table(rows)
+
+        st.subheader("R²（解釋力）")
+        rows = [
+            {"依變數": dep, "R²": v.get("r_squared"), "調整後 R²": v.get("adj_r_squared"), "解釋力等級": _r2_level(v.get("r_squared"))}
+            for dep, v in s.get("r_squared", {}).items()
+        ]
+        _show_table(rows)
+
         st.subheader("HTMT（區辨效度）")
-        st.json(s.get("validity", {}).get("htmt", {}))
+        st.caption("同一對構面只會出現一次（下三角矩陣）。門檻：< 0.85 嚴格通過，< 0.90 寬鬆通過，≥ 0.90 有疑慮。由高到低排序，最需要注意的排最前面。")
+        rows = []
+        for construct_a, row in s.get("validity", {}).get("htmt", {}).items():
+            for construct_b, v in row.items():
+                rows.append({"構面 A": construct_a, "構面 B": construct_b, "HTMT": v, "判讀": _htmt_status(v)})
+        rows.sort(key=lambda r: r["HTMT"] if r["HTMT"] is not None else -1, reverse=True)
+        _show_table(rows)
+
         st.subheader("f² 效果量")
-        st.json(s.get("f_squared", {}))
-        st.subheader("Q²predict / PLSpredict")
-        st.json(s.get("predictive", {}))
+        st.caption("只顯示結構模型裡實際存在的路徑（前因 → 結果），忽略沒有直接路徑的 0 值組合。門檻依 Cohen 慣例：≥0.35 大、≥0.15 中、≥0.02 小。")
+        rows = []
+        for predictor, row in s.get("f_squared", {}).items():
+            for outcome, v in row.items():
+                if predictor == outcome or not v:
+                    continue
+                rows.append({"前因構面": predictor, "結果構面": outcome, "f²": v, "效果量等級": _f2_level(v)})
+        rows.sort(key=lambda r: r["f²"] if r["f²"] is not None else -1, reverse=True)
+        _show_table(rows)
+
+        st.subheader("Q²predict / PLSpredict（樣本外預測力）")
+        st.caption("每個題項一列。Q²>0 代表模型有預測力；PLS RMSE 若小於 LM 基準 RMSE，代表 PLS 模型優於單純線性迴歸基準（Shmueli et al. 2019 的判讀方式）。")
+        rows = [
+            {
+                "題項": item, "Q²predict": v.get("q2predict"), "判讀": _q2_status(v.get("q2predict")),
+                "PLS RMSE": v.get("rmse_pls"), "LM 基準 RMSE": v.get("rmse_lm_benchmark"),
+                "優於線性基準": "🟢 是" if v.get("beats_lm_benchmark") else "🔴 否",
+            }
+            for item, v in s.get("predictive", {}).items()
+        ]
+        _show_table(rows)
+
+        st.subheader("VIF（共線性）")
+        st.caption("門檻：<3 優良，<5 可接受，≥5 有共線性問題。")
+        rows = []
+        for dep, vif_map in s.get("vif", {}).items():
+            for var, v in vif_map.items():
+                rows.append({"依變數": dep, "自變數": var, "VIF": v, "狀態": _vif_status(v)})
+        _show_table(rows)
+
     else:
         st.subheader("路徑顯著性")
-        for r in s.get("bootstrapping", []):
-            icon = "🟢" if r.get("significant") else "🔴"
-            st.write(f"{icon} {r['decision']}")
+        rows = [
+            {
+                "路徑": r.get("path"), "β": r.get("beta"), "t": r.get("t_stat"), "p": r.get("p_value"),
+                "顯著性": "🟢 顯著" if r.get("significant") else "🔴 不顯著",
+            }
+            for r in s.get("bootstrapping", [])
+        ]
+        _show_table(rows)
+
         st.subheader("VIF（共線性）")
-        st.json(s.get("vif", []))
-        st.subheader("R²")
-        st.json(s.get("r_squared", []))
+        st.caption("門檻：<3 優良，<5 可接受，≥5 有共線性問題。")
+        rows = [
+            {"依變數": r.get("dependent"), "自變數": r.get("variable"), "VIF": r.get("VIF"), "狀態": r.get("status")}
+            for r in s.get("vif", [])
+        ]
+        _show_table(rows)
+
+        st.subheader("R²（解釋力）")
+        rows = [{"依變數": r.get("dependent"), "R²": r.get("R2"), "解釋力等級": r.get("level")} for r in s.get("r_squared", [])]
+        _show_table(rows)
