@@ -32,16 +32,40 @@ services:
       retries: 3
       start_period: 20s
 
-  frontend:
+  # Phase 5b: single conversational interface (upload/declare/diagnose/
+  # optimize all in one chat thread, driven by /chat tool calling).
+  frontend-chat:
     build:
       context: .
-      dockerfile: Dockerfile.streamlit
-    container_name: survey-copilot-frontend
+      dockerfile: Dockerfile.gradio
+    container_name: survey-copilot-frontend-chat
     restart: unless-stopped
     depends_on:
       - api
     ports:
-      - "${FRONTEND_PORT:-8501}:8501"
+      - "${FRONTEND_CHAT_PORT:-7860}:7860"
+    volumes:
+      - ./webapp:/app/webapp:cached
+    environment:
+      - BACKEND_URL=http://api:8000
+      - API_KEY=${API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+    env_file:
+      - .env
+
+  # Phase 5a: original multi-page wizard (L0-L5 as separate pages), kept
+  # alongside the chat interface for step-by-step manual control / demos.
+  frontend-streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: survey-copilot-frontend-streamlit
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${FRONTEND_STREAMLIT_PORT:-8501}:8501"
     volumes:
       - ./streamlit_app:/app/streamlit_app:cached
     environment:

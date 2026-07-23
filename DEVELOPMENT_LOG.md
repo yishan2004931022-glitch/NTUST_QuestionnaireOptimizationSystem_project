@@ -164,3 +164,80 @@ Phase 0-4 做完後盤點四個已知小缺口，逐一處理：
 修法：`_check_l2_gate()` 加同一行過濾，只檢查 2 題以上的構面。補了一個測試（`test_l2_gate_ignores_single_item_pseudo_constructs`）把單題假構面混進乾淨的 construct_dict，確認不會被誤擋。
 
 **教訓**：同一個「這是不是一個要被檢定的構面」判斷邏輯，出現在兩個不同的地方（資訊性檢查 vs 硬性關卡），寫第二個的時候很容易忘記第一個已經處理過這個邊界情況。新增關卡類的功能時，要主動去找「這個系統裡還有沒有類似但範疇更廣的既有邏輯」，不能只看自己這個端點的輸入。這個 bug 也是在幫使用者驗證另一個 bug 有沒有修好的過程中，用真實資料手動測試才發現的——再次印證「自己動手用真實資料跑一次」比只看程式碼推論可靠。
+
+## 階段 14：Phase 5b——多輪對話介面，前端整個換成純聊天（不用分頁）
+
+使用者要的不是「加一個聊天分頁」，而是整個操作方式都改成對話：上傳資料、宣告構面/結構路徑、跑 L1-L3 診斷、看建議、討論、決定要不要調參數重跑，全部在同一串對話裡完成，不要分頁。
+
+**框架選型**：原本評估過要不要用 LangChain/LangGraph，查證後確認這個需求（單一 agent、有限工具、不需要分支/迴圈/多 agent 協作）用原生 SDK 的 tool calling 就夠，不需要額外框架——LangGraph 官方建議也是「基本聊天機器人請直接用 SDK，用 LangGraph 是過度工程」。前端部分原本是 Streamlit，但 Streamlit 的 `st.chat_message` 每次互動要整頁 rerun，對話變長會變慢；改評估 Chainlit 跟 Gradio，Chainlit 原創始團隊已經在 2025 年中離開去創業、改由社群維護，而且 2025-2026 年爆出兩個高風險 CVE（任意檔案讀取 + SSRF，可以偷 API 金鑰跟雲端憑證）——這個系統本身就存放 LLM API 金鑰，這個風險直接排除不用。最後選 Gradio：Hugging Face 持續維護、無資安包袱、原生支援工具呼叫視覺化跟串流。
+
+**後端（`app/main.py`）**：新增 `POST /chat`，核心是一個有上限（4 輪）的 tool-calling 迴圈，OpenAI 跟 Anthropic 兩種 wire format 分開處理（兩家對「助理呼叫工具」跟「工具回傳結果」的訊息格式編碼方式完全不同，硬要共用一套格式反而更複雜）。定義三個工具：
+
+- `set_declaration`：把使用者對構面/結構路徑的描述轉成結構化宣告，**合併不覆蓋**（跟階段 13 Bug A 同一個教訓，這次直接在設計時就避開，`_merge_dict_of_lists()` 只更新有帶到的 key，其他 key 維持原樣）；題項名稱如果資料檔裡找不到，直接拒絕整次更新，不會部分套用。
+- `run_full_pipeline`：對已上傳資料依序跑 L1 資料品質、L2 測量模型、L3 結構模型，共用既有的 `detect_careless_responses`/`calc_cronbach`/`calc_bootstrapping` 等函式，L2 沒過一樣走 `_check_l2_gate()` 擋下 L3，不會讓 LLM 自己決定要不要略過關卡。
+- `rerun_optimization`：對應既有 `/optimize/full-search` 背後同一顆 `optimize_unified()`，LLM 可以帶參數（`max_drop_ratio`、`boot_iterations`、`require_data_quality_flag`），後端一樣把數值夾到 0.02-0.30 的範圍，不信任 LLM 給的原始值。
+
+每次工具執行都照樣寫 `audit_log`，`rerun_optimization` 額外標記 `request_params.triggered_by = "chat"`、`is_exploratory = True`，跟手動觸發的紀錄用同一套稽核邏輯，只是多一個欄位可以追溯是不是聊天觸發的。對話歷史存在 session（跟 df、construct_dict 同一個容器），只存 `{"role","content"}` 這種 provider 無關的純文字格式——工具呼叫當下那些 provider 專屬的訊息格式只在單次請求內部使用，不寫回 session，這樣使用者中途換 provider 也不會壞掉。
+
+**前端**：整個刪掉 `streamlit_app/`（七個分頁），換成 `webapp/app.py`，一個 Gradio `Blocks` 頁面：檔案上傳 + 對話框 + LLM 設定（選填，留空吃後端環境變數）。上傳成功後不額外呼叫 LLM，直接用後端回傳的欄位/自動偵測構面組一段固定文字放進對話框——這樣開場白不用等 LLM、也不會有開場白被幻覺污染的風險。工具執行的結構化結果（信效度數字、路徑顯著性、Stage A/B 搜尋紀錄）額外格式化成 Markdown 附在同一則助理訊息下面，不是只顯示 LLM 自己講的那段話。
+
+**踩到的坑**：
+1. Gradio 6.20（拉 `gradio>=5.0.0` 沒設上限，直接抓到最新的 6.x）把 `gr.Chatbot(type=...)` 這個參數拿掉了（messages 格式現在是唯一格式，不用再指定），`theme=` 也從 `Blocks()` 建構子搬到 `launch()`，照著網路上 Gradio 5 的範例寫直接炸掉，改用容器內實際安裝的版本試出正確寫法。
+2. 又一次忘記「Python 程式碼改了要 `docker compose restart api`」（階段 11 已經寫過的教訓，這次真的又忘記一次）——加完 `/chat` 端點直接用 curl 測試打 404，以為是路由沒寫對，實際上是舊的 uvicorn process 還在跑改之前的程式碼。
+
+**驗證方式**：89 個既有測試全過（沒動到既有端點邏輯），新增 11 個 `TestChatEndpoint` 測試（`_call_llm_chat` 用假函式取代，直接呼叫真正的 `_execute_chat_tool` 分派，這樣可以測到真正的 session 狀態變化、L2 關卡、審計紀錄，不用真的打 LLM API）。另外拿真實 LLM key 手動跑了一次完整流程：上傳合成資料 → 傳一句話同時宣告構面跟結構路徑並要求跑分析 → LLM 正確依序呼叫 `set_declaration` 再呼叫 `run_full_pipeline`，回覆內容跟後端真實算出來的 bootstrapping 結果一致（TR→PE 顯著、TR→EE/PE→EE 不顯著），沒有自己編數字；接著在同一個對話裡要求「把刪除比例放寬到 20% 重跑」，LLM 正確呼叫 `rerun_optimization` 並帶 `max_drop_ratio=0.2`，搜尋依然救不回顯著性時**誠實回報搜尋失敗**，沒有硬湊一個假顯著結果——這是階段 6/7 那個「安全機制要驗證『擋不擋得住』而不是『存不存在』」的教訓，這次在 LLM 觸發的路徑上重新驗證了一次，結果一致。
+
+## 階段 15：使用者第一次真的拿去用，馬上就撞到一個 bug——工具混淆 + 盲目重試
+
+Phase 5b 上線後使用者拿真實資料（185 筆、10 個構面）馬上實測，一句話宣告結構路徑：「ATT: 由 TRU, PE, EE, SI, FC 組成；同時 ATT: 由 TE, OE, EC 組成。BI: 由 ATT 組成。」結果 LLM 把 `TRU`、`PE`、`EE`⋯這些**構面名稱**當成題項塞進 `construct_dict`（應該要放進 `structural_model`），`set_declaration` 當然失敗（資料檔裡沒有叫做 `TRU`、`EC`、`OE` 這種欄位）。更糟的是 LLM 沒有看錯誤訊息調整，而是**用一模一樣的參數連續重試** 4 次，直接撞到 `MAX_CHAT_TOOL_ITERATIONS` 上限，整輪對話沒有任何進展。
+
+根因：「A 由 B、C、D 組成」這句中文本身就有歧義——可以是測量描述（B、C、D 是 A 的題項）也可以是結構描述（B、C、D 是預測 A 的構面），純粹靠 tool description 裡的英文/中文說明，模型沒能穩定分辨。
+
+**修法，三處一起改**：
+1. `_tool_exec_set_declaration()` 驗證失敗時，如果「找不到的題項欄位」剛好命中已知的構面名稱，錯誤訊息裡直接加一句提示：這些名稱看起來是構面、要放 `structural_model`。這是讓**工具的回傳結果自己教模型下一步該怎麼做**，而不是只靠系統提示詞事先講一次就要它記住。
+2. `_call_llm_chat()` 的 tool-calling 迴圈加一個去重防線：同一輪對話裡，`(工具名稱, 參數)` 完全相同的呼叫只會真正執行一次，第二次以後直接回一個「不要再重試，請修正或停下來問使用者」的罐頭訊息——不管模型有沒有讀懂前面的提示，這道防線都會強制打斷盲目重試迴圈，不必完全信任模型會自我修正。
+3. `CHAT_SYSTEM_PROMPT` 明確加規則：`construct_dict` 只能放題項欄位、`structural_model` 只能放構面名稱，並且「工具失敗不要用同樣參數重試，卡住就直接跟使用者說」。
+
+**驗證方式**：新增兩個測試——一個直接測試提示訊息內容（`test_set_declaration_hints_when_construct_names_used_as_items`），一個用假造的 OpenAI client 模擬「LLM 對同一個失敗呼叫重試兩次」，確認 `_execute_chat_tool` 真正只被執行一次、第二次被去重防線攔下（`test_repeated_identical_tool_call_is_not_re_executed`）。寫這個測試的過程中自己也踩了一個小坑：測試檔案本身沒有 `import json`，測試裡的假 client helper 用了 `json.dumps`，直接讓 `/chat` 回 500，錯誤訊息是「name 'json' is not defined」——先以為是新寫的去重邏輯本身壞了，實際上是測試工具函式漏 import，跟階段 12 的教訓一樣：先懷疑自己剛寫的東西，不要急著懷疑核心邏輯。
+
+用使用者原始輸入（同樣的構面名稱、同樣的句子）重新跑一次：LLM 第一次呼叫還是一樣把構面名塞進 `construct_dict`（提示無法保證模型一次就用對工具，這是預期中的事），但這次錯誤訊息裡的提示成功讓它在**下一步立刻自我修正**，改成正確呼叫 `structural_model={"ATT": ["TRU","PE","EE","SI","FC","TE","OE","EC"], "BI": ["ATT"]}`，接著呼叫 `run_full_pipeline` 成功跑完，全程只用 3 次工具呼叫（上限是 4），沒有再卡住。100 個既有測試（含新的 2 個）全過。
+
+## 階段 16：同一次實測，馬上又撞到第二個 bug——上傳成功訊息只是前端裝飾，LLM 其實完全不知道有資料
+
+階段 15 修完後使用者馬上重新整個測，這次是全新 session（可能點了「重置對話與資料」）：上傳「Test_1.csv」成功、Gradio 對話框正確顯示「✅ 已上傳...」跟自動偵測到的構面分組，接著打了「開始分析」，結果 LLM 回「您尚未上傳任何資料，無法進行分析」——明明訊息串上面自己都還看得到剛剛的上傳成功訊息。
+
+先懷疑是不是 session id 沒對上（前端狀態沒跟後端同步），直接查 SQLite 裡 `audit_log` 這次互動的原始紀錄（不需要使用者配合重現，資料早就寫進去了）：上傳跟這次失敗的 `chat_message` 兩筆紀錄 `user_id`、`dataset_id` 完全一樣，證明後端 session 是對的、資料確實在。但失敗那筆紀錄的 `tool_calls` 是空陣列——**LLM 根本沒有呼叫任何工具去確認，直接用猜的回答「沒有資料」**。
+
+真正的根因：Gradio 前端 `on_upload()` 顯示的「✅ 已上傳...」那則訊息，是前端組出來直接塞進畫面的本地字串，**從來沒有送進後端 `session["chat_history"]`**——這樣做是為了讓上傳後的回覆不用等 LLM（快、也不花 token），但代價是後端維護的「真正會餵給 LLM 的對話紀錄」跟「畫面上使用者看到的對話紀錄」是兩份不同步的東西。使用者這次是全新 session，第一句真正送進 `/chat` 的訊息就是「開始分析」，此時 `session["chat_history"]` 是空的，LLM 看到的整段對話就只有這一句話，完全不知道有資料存在，就照系統提示詞規則 4（「使用者還沒上傳資料，先請他們上傳」）猜了一個錯誤答案。
+
+**修法**：`/upload` 端點在 `_set_user_session()` 之後，直接把一則描述這次上傳（檔名、筆數、欄位數、自動偵測到的構面分組）的訊息，用 `role: "user"` 寫進 `session["chat_history"]`（標註「系統提示，非使用者本人輸入」）。這樣不管使用者上傳完之後打的第一句話是什麼，`/chat` 端點組出的對話紀錄裡都保證至少有這一筆，LLM 不用用猜的。前端那則裝飾用的「✅ 已上傳...」訊息繼續保留（還是不用等 LLM），現在是「畫面顯示」跟「LLM 真正看到的上下文」兩邊都各自正確，只是不再假設兩者是同一份資料。
+
+**教訓**：任何「為了體驗快，前端自己組訊息、不透過真正的對話流程」的捷徑，都要想清楚**這個捷徑塞進去的內容，之後串接到別的路徑時看不看得到**——這裡的裝飾訊息只活在瀏覽器畫面上，跟真正驅動 LLM 的資料完全是兩條路，寫的當下沒發現，因為兩條路平常大部分情況下「感覺起來」是同步的（因為使用者通常會先聊個幾句才問正事，這時候 `chat_history` 已經有東西了，不會是空的）——只有在「上傳後的第一句話就是正事」這個最短路徑才會露餡，剛好就是使用者這次做的事。
+
+**驗證方式**：新增兩個測試（`test_upload_seeds_chat_history_so_first_message_has_grounding`、`test_reupload_replaces_chat_history_not_appends`），另外兩個既有測試因為 `chat_history` 现在多了種子訊息在最前面，調整斷言方式（比對訊息陣列的後半段，而不是整個陣列）。用使用者的真實構面名稱重新跑一次「上傳 → 開始分析」，這次 LLM 正確呼叫 `run_full_pipeline`，回報的是真實算出來的信效度結果，不再幻覺「沒有資料」。104 個測試全過。
+
+## 階段 17：Groq 額度撞牆兩次——一次是真的用完額度，一次是自己的訊息設計有問題
+
+**第一次（外部額度用完，不是 bug）**：階段 16 修完後使用者再測，這次收到 429「Rate limit reached ... tokens per day (TPD): Limit 100000, Used 94730」——`llama-3.3-70b-versatile` 在 Groq 免費層的每日 token 額度被我（階段 14-16 反覆用真實 LLM key 驗證）加上使用者自己的測試一起用完了。這不是程式邏輯的錯，純粹是共用同一把免費 API key 的代價。當下建議使用者在 Gradio 的「LLM 設定」把 Model 換成額度上限高很多的 `llama-3.1-8b-instant` 應急。
+
+**第二次（換小模型後撞到另一個真的 bug）**：換成 `llama-3.1-8b-instant` 後，下一句話就收到 413「Request too large ... tokens per minute (TPM): Limit 6000, Requested 9056」——這次不是額度用完，是**單一次請求**就超過小模型的每分鐘 token 上限，代表我們送出去的單一 request 本身異常肥大，值得認真查。
+
+根因：`detect_careless_responses()`（L1）回傳的結果裡有一個 `respondents` 陣列，**每一筆受訪者都佔一個 dict**（185 筆資料就是 185 個 entry），這個完整結果被 `run_full_pipeline` 工具原封不動當作「工具執行結果」塞進對話，在同一輪對話裡下一次呼叫 LLM 時整包 JSON 又要重新送一次——185 筆的逐筆明細序列化後保守估計就吃掉大幾千 token，這才是撞上 TPM 上限的真正原因。而這個逐筆明細其實從頭到尾沒有任何地方真的需要它：前端 `_fmt_data_quality()` 只顯示 `flagged_count`／`total_respondents` 兩個彙總數字，LLM 也只會拿彙總數字講話，逐筆明細只是単純被「順手」原封不動轉傳，沒有被用到。
+
+**修法**：新增 `_trim_tool_result_for_llm()`，只在「把工具結果重新餵回 LLM 對話」這個路徑上把 `data_quality.respondents` 拿掉，其餘欄位不動；**API 回應、audit_log、session 裡存的還是完整版**（稽核紀錄的完整性不能因為要省 LLM token 而打折扣），只有「送進 LLM 對話」這一份是刪減過的。這樣分兩份是刻意的：一份給人看／稽核用（要完整），一份給 LLM 讀（只要摘要）。
+
+**教訓**：工具呼叫的回傳值如果直接就是後端 API 原本的完整回應格式，要想清楚**這個完整格式裡有沒有「給人看的細節」被順手也送進了 LLM 的對話上下文**——這兩種消費者（人 vs. LLM）要的粒度通常不一樣，尤其是任何「每筆樣本一個 entry」這種會隨資料量線性成長的欄位，越大的資料集越容易撞到 provider 的單次請求大小上限，而且不會是額度用完那種「明顯是外部問題」的錯誤訊息，很容易被誤認成別的 bug。
+
+**驗證方式**：新增 `test_trim_tool_result_for_llm_strips_respondent_list`，確認 `respondents` 被拿掉、其他欄位不變、且不會動到傳進去的原始 dict（呼叫端例如 audit log 用的還是同一個物件）。修完後用同一份 185 筆資料、同樣的結構路徑宣告，改指定 `model=llama-3.1-8b-instant` 重新走一次「上傳 → 宣告 → 跑完整分析」，這次沒有再收到 413；不過也觀察到 8B 這種小模型對「構面名稱該放 construct_dict 還是 structural_model」這個提示的理解力明顯比 70B 弱（兩次嘗試都沒抓對，最後選擇誠實跟使用者確認而不是繼續瞎猜），這是小模型能力落差的預期取捨，不是新 bug。105 個測試全過。
+
+## 階段 18：使用者要求兩套前端並存，不要二選一
+
+階段 14 把 Streamlit 七頁介面整個刪掉、換成 Gradio 單一對話介面。使用者用過 Gradio 版本、也踩過幾次 Groq 免費額度限制（階段 17）之後，提出想要兩套前端都留著，不要只能選一個。
+
+這個需求技術上很單純，因為兩套前端從一開始就是「同一個後端的兩種呼叫方式」，沒有互相依賴：從 git 歷史（`f5c9171`，刪除前的最後一版）把 `streamlit_app/`、`Dockerfile.streamlit` 整份取回來，`docker-compose.yml` 原本的 `frontend` 服務改名成 `frontend-chat`（Gradio，7860 port），另外加回 `frontend-streamlit`（8501 port），兩個都 `depends_on: api`、都指到同一個後端網址 `http://api:8000`，port 各自獨立不衝突。後端 `app/main.py` 完全沒動——階段 14 加 `/chat` 的時候本來就沒有修改任何既有端點的行為，所以 Streamlit 頁面撿回來可以直接原樣運作。
+
+**小插曲**：第一次 `docker compose up -d frontend-chat frontend-streamlit` 時，因為前一個版本改名前的 `survey-copilot-frontend` 容器還占著 7860 port（compose 判定成 orphan container，沒有自動清掉），要先 `docker rm -f` 那個孤兒容器。清掉重跑後，`frontend-chat` 容器雖然顯示 `Up`，但 `docker port` 查出來完全沒有 host port 綁定（`7860/tcp` 對應空陣列）——用 `docker compose stop/rm/up` 把這個容器整個重建一次才正常綁定，猜測是新舊容器搶同一個 port 交接時的短暫競態，不是 compose 設定寫錯（`frontend-streamlit` 那次沒有這個問題，設定完全對稱）。
+
+**文件更新**：`PROFESSOR_REPORT.md` 的架構圖跟部署段落，從「Gradio 取代 Streamlit」改回「兩者並存，各自獨立部署、共用同一個後端」。
+
+**驗證方式**：兩個 container 都跑起來、對各自的 port 都拿到 200（`http://localhost:7860`、`http://localhost:8501`），後端 `/health` 不受影響。後端邏輯完全沒改，105 個既有測試不需要重跑也知道不會受影響，但還是重新跑過一次確認。

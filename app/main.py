@@ -348,6 +348,16 @@ class CompositeInput(BaseModel):
     bootstrap: Optional[int] = 100
 
 
+class ChatInput(BaseModel):
+    message: str
+    provider: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+    temperature: Optional[float] = 0.3
+    max_tokens: Optional[int] = 1500
+
+
 # ─── Upload ──────────────────────────────────────────────────────
 
 @app.post("/upload")
@@ -372,6 +382,21 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "declaration_id": declaration_id,
         }
         _set_user_session(request, session)
+        # The frontend shows a friendly "已上傳..." bubble immediately without
+        # round-tripping through the LLM (fast, free), but that bubble is
+        # purely local UI state -- it was never part of session["chat_history"],
+        # so the very first real /chat call had zero grounding that data
+        # existed and the model would just guess. Seeding chat_history here
+        # means every chat call in this session starts with real context.
+        _get_user_session(request)["chat_history"] = [{
+            "role": "user",
+            "content": (
+                f"（系統提示，非使用者本人輸入）我剛剛上傳了問卷資料「{file.filename}」，"
+                f"{len(df)} 筆、{len(df.columns)} 個欄位。自動偵測到的構面分組："
+                + "；".join(f"{c}: {', '.join(items)}" for c, items in construct_dict.items())
+                + "。之後的對話請根據這份已上傳的資料回答，不用再問我有沒有上傳資料。"
+            ),
+        }]
         save_session(df, construct_dict, request=request)
         audit_db.log_action(
             user_id, "upload",
@@ -1247,6 +1272,458 @@ async def analyze_composite(request: Request, body: CompositeInput):
         return result
     except Exception:
         raise HTTPException(status_code=500, detail="Composite Score 計算失敗")
+
+
+## ─── Phase 5b: Conversational chat interface ──────────────────────
+# The chat is an orchestration layer over the exact same endpoints/gates
+# used elsewhere (L2 hard gate, audit_log, optimize_unified) -- the LLM
+# never invents statistics, it only calls tools and narrates their
+# real return values. See DEVELOPMENT_LOG.md for the design rationale.
+
+CHAT_SYSTEM_PROMPT = (
+    "你是 Survey Co-Pilot，協助使用者診斷與優化問卷（PLS-SEM）的助理。"
+    "你可以呼叫工具：(1) set_declaration 把使用者對構面/結構路徑的描述轉成結構化宣告，"
+    "(2) run_full_pipeline 對已上傳資料執行完整診斷（資料品質、測量模型信效度、結構路徑顯著性），"
+    "(3) rerun_optimization 依使用者想調整的參數重新執行結構路徑優化搜尋。"
+    "規則：\n"
+    "1. 絕對不能自己編造統計數字，所有數字都必須來自工具回傳的結果，沒有工具結果就不要講具體數字。\n"
+    "2. 每次工具執行完，用白話文解釋結果、指出問題在哪、給出下一步建議，並清楚講你剛剛執行了什麼、用了什麼參數 -- 不能悄悄執行不講。\n"
+    "3. 如果測量模型沒過 L2 關卡導致結構分析被擋下，要照實告訴使用者，不能假裝有跑出結構路徑結果。\n"
+    "4. 如果使用者還沒上傳資料，先請他們上傳。\n"
+    "5. set_declaration 的 construct_dict 參數只能放「題項欄位名稱」（資料檔裡實際存在的欄位），不能放構面名稱；"
+    "structural_model 參數只能放「構面名稱」（哪個構面受哪些構面影響），不能放題項欄位名稱。"
+    "使用者說『A 由 B、C、D 組成』這種話有可能是在講結構路徑（B、C、D 是預測 A 的構面），"
+    "也可能是在講測量題項（B、C、D 是 A 底下的題項）——如果 B、C、D 本身就是已知的構面名稱，"
+    "那幾乎一定是在講結構路徑，要放進 structural_model，不要放進 construct_dict。不確定就直接問使用者，不要用工具亂猜。\n"
+    "6. 工具呼叫失敗時，先讀懂錯誤訊息裡的原因再決定下一步；絕對不要用完全一樣的參數重複呼叫同一個工具——"
+    "如果修正後還是不確定要怎麼做，就停下來，直接跟使用者說卡在哪裡、需要什麼資訊，不要一直重試。\n"
+    "7. 用繁體中文回覆。"
+)
+
+CHAT_TOOLS_OPENAI = [
+    {
+        "type": "function",
+        "function": {
+            "name": "set_declaration",
+            "description": "設定或更新構面（測量模型）與結構路徑宣告。只帶要更新的部分即可，沒提到的構面/路徑會維持原樣（合併，不是整個覆蓋）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "construct_dict": {
+                        "type": "object",
+                        "description": "構面名稱 -> 題項欄位名稱陣列（欄位名稱必須跟資料檔的欄位一致）。",
+                        "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "structural_model": {
+                        "type": "object",
+                        "description": "依變數構面 -> 自變數構面名稱陣列（結構路徑假設，構面名稱要跟 construct_dict 裡的一致）。",
+                        "additionalProperties": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_full_pipeline",
+            "description": "對目前已上傳的資料與已宣告的構面/結構模型，依序執行 L1 資料品質檢測、L2 測量模型信效度診斷、L3 結構路徑顯著性分析並回傳結果。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rerun_optimization",
+            "description": "重新執行 Stage A/B 統一優化搜尋：調整參數後，針對還不顯著的結構路徑各自搜尋能不能透過刪除少量樣本達到顯著。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_drop_ratio": {"type": "number", "description": "最大可刪除樣本比例，範圍 0.02-0.30，預設 0.10"},
+                    "boot_iterations": {"type": "integer", "description": "bootstrap 迭代次數，預設 300"},
+                    "require_data_quality_flag": {"type": "boolean", "description": "刪除的樣本是否要求同時有 L1 資料品質標記佐證，預設 true，建議保持 true"},
+                },
+            },
+        },
+    },
+]
+
+CHAT_TOOLS_ANTHROPIC = [
+    {"name": t["function"]["name"], "description": t["function"]["description"], "input_schema": t["function"]["parameters"]}
+    for t in CHAT_TOOLS_OPENAI
+]
+
+
+def _merge_dict_of_lists(existing: Optional[dict], new: Optional[dict]) -> dict:
+    merged = dict(existing or {})
+    for k, v in (new or {}).items():
+        if isinstance(v, list):
+            merged[str(k)] = [str(x) for x in v]
+    return merged
+
+
+def _coerce_bool(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "")
+    return bool(value)
+
+
+def _tool_exec_set_declaration(session: Dict, request: Request, args: dict) -> dict:
+    df = session.get("df")
+    new_cd = args.get("construct_dict") or {}
+    new_sm = args.get("structural_model") or {}
+
+    if new_cd and df is not None:
+        missing = sorted({it for items in new_cd.values() for it in items if it not in df.columns})
+        if missing:
+            # A very common LLM mistake: the user describes a structural
+            # relationship ("ATT 由 TRU, PE 組成") and the model puts the
+            # *construct names* into construct_dict instead of putting them
+            # into structural_model -- construct_dict wants item/column
+            # names, structural_model wants construct names. Detecting that
+            # the "missing columns" are actually known construct names lets
+            # the tool result itself steer the model to the right field on
+            # its next attempt, instead of it blindly retrying the same call.
+            known_constructs = set(session.get("construct_dict", {}).keys()) | set(new_cd.keys())
+            looks_like_constructs = sorted(set(missing) & known_constructs)
+            hint = ""
+            if looks_like_constructs:
+                hint = (
+                    f"　提示：{looks_like_constructs} 看起來是構面名稱，不是題項欄位名稱。"
+                    "如果你要宣告的是「哪些構面會影響哪個構面」（結構路徑），"
+                    "請把這些名稱放進 structural_model 參數，不要放進 construct_dict。"
+                )
+            return {"error": f"這些題項欄位在資料檔裡找不到，沒有套用這次宣告：{missing}{hint}"}
+
+    updated = {}
+    if new_cd:
+        session["construct_dict"] = _merge_dict_of_lists(session.get("construct_dict"), new_cd)
+        updated["construct_dict"] = session["construct_dict"]
+    if new_sm:
+        session["chat_structural_model"] = _merge_dict_of_lists(session.get("chat_structural_model"), new_sm)
+        updated["structural_model"] = session["chat_structural_model"]
+
+    if not updated:
+        return {"error": "沒有帶 construct_dict 或 structural_model，沒有東西可以更新"}
+    return {"success": True, **updated}
+
+
+def _tool_exec_run_full_pipeline(session: Dict, request: Request, args: dict) -> dict:
+    df = session.get("df")
+    if df is None:
+        return {"error": "使用者還沒有上傳資料檔案，請先請使用者上傳。"}
+
+    construct_dict = session.get("construct_dict") or {}
+    if not construct_dict:
+        return {"error": "還沒有構面宣告，請先呼叫 set_declaration。"}
+    structural_model = session.get("chat_structural_model") or {}
+
+    latent_constructs = {k: v for k, v in construct_dict.items() if len(v) >= 2}
+
+    try:
+        data_quality = detect_careless_responses(df, construct_dict)
+    except Exception as e:
+        data_quality = {"error": str(e)}
+
+    reliability, convergent, low_loading_flags = {}, {}, []
+    for construct, items in latent_constructs.items():
+        reliability[construct] = calc_cronbach(df, items)
+        convergent[construct] = calc_loadings_ave_cr(df, items)
+        loadings = convergent[construct].get("loadings", {})
+        flagged = [it for it, ld in loadings.items() if ld < 0.7]
+        if flagged:
+            low_loading_flags.append({"construct": construct, "items": flagged})
+
+    total_latent = len(latent_constructs)
+    ave_passed = sum(1 for v in convergent.values() if v.get("AVE", 0) and v["AVE"] >= 0.5)
+    alpha_passed = sum(1 for v in reliability.values() if v.get("alpha") and v["alpha"] >= 0.7)
+
+    measurement = {
+        "reliability": reliability,
+        "convergent_validity": convergent,
+        "low_loading_flags": low_loading_flags,
+        "summary": {"latent_constructs": total_latent, "ave_passed": ave_passed, "alpha_passed": alpha_passed},
+    }
+
+    l2_passed, l2_blocked = _check_l2_gate(df, construct_dict)
+
+    structural = None
+    if not structural_model:
+        structural = {"skipped": True, "reason": "還沒有結構路徑宣告"}
+    elif not l2_passed:
+        structural = {"blocked_by_l2_gate": True, "blocked_constructs": l2_blocked}
+    else:
+        try:
+            structural = {
+                "bootstrapping": calc_bootstrapping(df, latent_constructs, structural_model, 300),
+                "vif": calc_vif(df, latent_constructs, structural_model),
+                "r_squared": calc_r_squared(df, latent_constructs, structural_model),
+            }
+        except Exception as e:
+            structural = {"error": str(e)}
+
+    result = {"data_quality": data_quality, "measurement": measurement, "structural": structural}
+    session["last_pipeline_result"] = result
+
+    audit_db.log_action(
+        _resolve_user_id(request), "chat_run_full_pipeline",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"construct_dict": construct_dict, "structural_model": structural_model},
+        result_summary=result,
+        is_exploratory=False,
+    )
+    return result
+
+
+def _tool_exec_rerun_optimization(session: Dict, request: Request, args: dict) -> dict:
+    df = session.get("df")
+    if df is None:
+        return {"error": "使用者還沒有上傳資料檔案。"}
+    construct_dict = session.get("construct_dict") or {}
+    structural_model = session.get("chat_structural_model") or {}
+    if not construct_dict or not structural_model:
+        return {"error": "還沒有完整的構面與結構路徑宣告，無法重跑優化搜尋，請先呼叫 set_declaration。"}
+
+    max_drop_ratio = min(max(float(args.get("max_drop_ratio") or 0.10), 0.02), 0.30)
+    boot_iterations = min(max(int(args.get("boot_iterations") or 300), 50), 1000)
+    require_dq = _coerce_bool(args.get("require_data_quality_flag"), True)
+
+    try:
+        result = optimize_unified(
+            df=df, construct_dict=construct_dict, structural_model=structural_model,
+            max_drop_ratio=max_drop_ratio, boot_iterations=boot_iterations,
+            require_data_quality_flag=require_dq,
+        )
+    except Exception as e:
+        return {"error": f"優化搜尋失敗：{e}"}
+
+    session["optimized_construct_dict"] = result["stage_a"]["optimized_construct_dict"]
+    session["last_pipeline_result"] = {**session.get("last_pipeline_result", {}), "optimize_full_search": result}
+
+    entry_id = audit_db.log_action(
+        _resolve_user_id(request), "optimize_full_search",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={
+            "triggered_by": "chat", "max_drop_ratio": max_drop_ratio,
+            "boot_iterations": boot_iterations, "require_data_quality_flag": require_dq,
+            "structural_model": structural_model,
+        },
+        result_summary=result,
+        is_exploratory=True,
+    )
+    return {"audit_entry_id": entry_id, **result}
+
+
+def _execute_chat_tool(name: str, args: dict, session: Dict, request: Request) -> dict:
+    if name == "set_declaration":
+        return _tool_exec_set_declaration(session, request, args or {})
+    if name == "run_full_pipeline":
+        return _tool_exec_run_full_pipeline(session, request, args or {})
+    if name == "rerun_optimization":
+        return _tool_exec_rerun_optimization(session, request, args or {})
+    return {"error": f"未知工具：{name}"}
+
+
+def _trim_tool_result_for_llm(name: str, result: dict) -> dict:
+    """
+    The full tool result (e.g. run_full_pipeline's per-respondent L1 signal
+    breakdown -- one entry per row) is what the audit log and the frontend
+    keep, but re-serializing it verbatim as the tool's "content" for the
+    *next* LLM call in the same tool-calling loop bloats that one request:
+    on a 185-respondent dataset this alone added ~9000 tokens to a single
+    request and tripped Groq's per-minute request-size limit even on a
+    small model. The LLM only ever narrates the aggregate counts
+    (flagged_count/total_respondents), never the row-level detail, so trim
+    it before it goes back into the conversation -- the full result is
+    still returned to the caller and still fully logged to audit_log.
+    """
+    if not isinstance(result, dict) or result.get("error"):
+        return result
+
+    trimmed = dict(result)
+    dq = trimmed.get("data_quality")
+    if isinstance(dq, dict) and "respondents" in dq:
+        trimmed["data_quality"] = {k: v for k, v in dq.items() if k != "respondents"}
+    return trimmed
+
+
+MAX_CHAT_TOOL_ITERATIONS = 4
+CHAT_TOOL_LIMIT_MESSAGE = "（這一輪已經連續呼叫太多次工具、而且沒有成功，先停在這裡——上面列出的是每次嘗試失敗的原因，可以參考後換句話再說一次，或把要求拆成比較小的步驟分開講。）"
+REPEAT_TOOL_CALL_RESULT = {
+    "error": "你剛剛已經用完全相同的參數呼叫過這個工具、而且失敗了，這次沒有重新執行。"
+              "不要再用一樣的參數重試——請根據前面的錯誤訊息修正參數，或者直接停下來跟使用者說明卡住的原因。",
+}
+
+
+def _dedupe_key(name: str, args) -> tuple:
+    try:
+        normalized = json.dumps(args or {}, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        normalized = str(args)
+    return (name, normalized)
+
+
+async def _call_llm_chat(
+    provider: str, api_key: str, model: str, messages: List[Dict],
+    temperature: float, max_tokens: int, base_url: Optional[str],
+    session: Dict, request: Request,
+):
+    """
+    messages: plain {"role": "user"/"assistant", "content": str} turns only.
+    Tool-call bookkeeping (which differs a lot between OpenAI and Anthropic's
+    wire formats) stays local to this one call and is never persisted back
+    into session chat history -- that keeps the stored history provider-
+    agnostic even if the user switches provider between messages.
+    Returns (reply_text, tool_results).
+    """
+    provider = str(provider or "").lower().strip()
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"不支援的 provider：{provider}")
+
+    tool_results: List[Dict] = []
+
+    if provider == "openai":
+        from openai import AsyncOpenAI as OpenAI
+        client = OpenAI(api_key=api_key or "", base_url=base_url or None)
+        req_model = model or "gpt-4o-mini"
+        convo = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}] + list(messages)
+        seen_calls = set()
+
+        for _ in range(MAX_CHAT_TOOL_ITERATIONS):
+            completion = await client.chat.completions.create(
+                model=req_model, temperature=float(temperature), max_tokens=int(max_tokens),
+                tools=CHAT_TOOLS_OPENAI, messages=convo,
+            )
+            msg = completion.choices[0].message
+            if not msg.tool_calls:
+                return msg.content or "", tool_results
+
+            convo.append({
+                "role": "assistant", "content": msg.content,
+                "tool_calls": [
+                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ],
+            })
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except Exception:
+                    args = {}
+                key = _dedupe_key(tc.function.name, args)
+                if key in seen_calls:
+                    result = REPEAT_TOOL_CALL_RESULT
+                else:
+                    seen_calls.add(key)
+                    result = _execute_chat_tool(tc.function.name, args, session, request)
+                tool_results.append({"name": tc.function.name, "args": args, "result": result})
+                llm_facing = _trim_tool_result_for_llm(tc.function.name, result)
+                convo.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(llm_facing, ensure_ascii=False, default=str)})
+
+        return CHAT_TOOL_LIMIT_MESSAGE, tool_results
+
+    if provider == "anthropic":
+        import anthropic
+        cli = anthropic.Anthropic(api_key=api_key or "")
+        req_model = model or "claude-3-5-haiku-20241022"
+        convo = list(messages)
+        seen_calls = set()
+
+        for _ in range(MAX_CHAT_TOOL_ITERATIONS):
+            msg = cli.messages.create(
+                model=req_model, temperature=float(temperature), max_tokens=int(max_tokens),
+                system=CHAT_SYSTEM_PROMPT, tools=CHAT_TOOLS_ANTHROPIC, messages=convo,
+            )
+            if msg.stop_reason != "tool_use":
+                text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+                return text, tool_results
+
+            convo.append({"role": "assistant", "content": msg.content})
+            result_blocks = []
+            for block in msg.content:
+                if getattr(block, "type", "") != "tool_use":
+                    continue
+                key = _dedupe_key(block.name, block.input or {})
+                if key in seen_calls:
+                    result = REPEAT_TOOL_CALL_RESULT
+                else:
+                    seen_calls.add(key)
+                    result = _execute_chat_tool(block.name, block.input or {}, session, request)
+                tool_results.append({"name": block.name, "args": block.input, "result": result})
+                llm_facing = _trim_tool_result_for_llm(block.name, result)
+                result_blocks.append({
+                    "type": "tool_result", "tool_use_id": block.id,
+                    "content": json.dumps(llm_facing, ensure_ascii=False, default=str),
+                })
+            convo.append({"role": "user", "content": result_blocks})
+
+        return CHAT_TOOL_LIMIT_MESSAGE, tool_results
+
+
+@app.post("/chat")
+async def chat(request: Request, body: ChatInput):
+    session = _get_user_session(request)
+    history = session.setdefault("chat_history", [])
+
+    if not body.message or not body.message.strip():
+        raise HTTPException(status_code=400, detail="訊息不能是空的")
+
+    provider = (body.provider or os.environ.get("LLM_PROVIDER") or "").strip().lower()
+    api_key = body.api_key or os.environ.get("LLM_API_KEY", "")
+    model = body.model or os.environ.get("LLM_MODEL", "")
+    base_url = body.base_url or os.environ.get("LLM_BASE_URL", "")
+
+    if not api_key or provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="請提供有效的 LLM provider 與 api_key（或在後端環境變數設定 LLM_PROVIDER / LLM_API_KEY）")
+
+    history.append({"role": "user", "content": body.message})
+
+    try:
+        reply, tool_results = await _call_llm_chat(
+            provider=provider, api_key=api_key, model=model, messages=history,
+            temperature=float(body.temperature or 0.3), max_tokens=int(body.max_tokens or 1500),
+            base_url=base_url, session=session, request=request,
+        )
+    except HTTPException:
+        history.pop()
+        raise
+    except Exception as e:
+        history.pop()
+        raise HTTPException(status_code=500, detail=f"LLM 呼叫失敗：{e}")
+
+    history.append({"role": "assistant", "content": reply})
+
+    audit_db.log_action(
+        _resolve_user_id(request), "chat_message",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"message": body.message, "tool_calls": [t["name"] for t in tool_results]},
+        result_summary={"reply": reply, "tool_results": tool_results},
+        is_exploratory=any(t["name"] == "rerun_optimization" for t in tool_results),
+    )
+
+    return {
+        "reply": reply,
+        "tool_calls": tool_results,
+        "construct_dict": session.get("construct_dict"),
+        "structural_model": session.get("chat_structural_model"),
+    }
+
+
+@app.get("/chat/history")
+async def chat_history(request: Request):
+    session = _get_user_session(request)
+    return {"history": session.get("chat_history", [])}
+
+
+@app.post("/chat/reset")
+async def chat_reset(request: Request):
+    session = _get_user_session(request)
+    session["chat_history"] = []
+    return {"success": True}
 
 
 @app.get("/session/info")
