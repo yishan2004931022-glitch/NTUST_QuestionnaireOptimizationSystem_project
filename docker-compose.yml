@@ -35,17 +35,19 @@ services:
   frontend:
     build:
       context: .
-      dockerfile: Dockerfile.streamlit
+      dockerfile: Dockerfile.gradio
     container_name: survey-copilot-frontend
     restart: unless-stopped
     depends_on:
       - api
     ports:
-      - "${FRONTEND_PORT:-8501}:8501"
+      - "${FRONTEND_PORT:-7860}:7860"
     volumes:
-      - ./streamlit_app:/app/streamlit_app:cached
+      - ./webapp:/app/webapp:cached
     environment:
       - BACKEND_URL=http://api:8000
       - API_KEY=${API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - LLM_MODEL=${LLM_MODEL:-}
     env_file:
       - .env

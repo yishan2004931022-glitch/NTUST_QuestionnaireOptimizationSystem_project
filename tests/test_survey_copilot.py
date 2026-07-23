@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import shutil
 import tempfile
+import json
 import sys, os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -30,6 +31,7 @@ from app.stats_engine import (
 
 from fastapi.testclient import TestClient
 from app.main import app, _inprocess_sessions
+from app import main as main_module
 from app import db as audit_db
 
 # ─────────────────────────────────────────────
@@ -1034,3 +1036,296 @@ class TestDeclarationAndAuditEndpoints:
 
         history = client.get("/audit/history").json()["entries"]
         assert any(e["action"] == "analyze_full" for e in history)
+
+
+# ─────────────────────────────────────────────
+# Phase 5b: Chat endpoint tests
+#
+# _call_llm_chat is monkeypatched to a fake that "decides" a fixed sequence
+# of tool calls and drives them through the real _execute_chat_tool dispatch
+# -- this exercises the real tool executors, session mutation, L2 gate, and
+# audit logging without hitting an actual LLM provider.
+# ─────────────────────────────────────────────
+
+class TestChatEndpoint:
+    def _fake_llm(self, plan):
+        async def fake(provider, api_key, model, messages, temperature, max_tokens, base_url, session, request):
+            tool_results = []
+            for name, args in plan:
+                result = main_module._execute_chat_tool(name, args, session, request)
+                tool_results.append({"name": name, "args": args, "result": result})
+            return "好的，已經處理完成。", tool_results
+        return fake
+
+    def test_chat_requires_api_key(self, synthetic_df):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/chat", json={"message": "hi"})
+        assert r.status_code == 400
+
+    def test_chat_rejects_empty_message(self, synthetic_df, monkeypatch):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([]))
+        r = client.post("/chat", json={"message": "  ", "provider": "openai", "api_key": "fake"})
+        assert r.status_code == 400
+
+    def test_upload_seeds_chat_history_so_first_message_has_grounding(self, synthetic_df):
+        # Real-world bug: the frontend shows an upload acknowledgment bubble
+        # that never reached the backend's session["chat_history"], so a
+        # user's very first real message (e.g. "開始分析") arrived with an
+        # empty history and the LLM had zero grounding that data existed --
+        # it would just guess "no data uploaded" without even calling a
+        # tool to check. /upload must seed chat_history so this can't happen.
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        hist = client.get("/chat/history").json()["history"]
+        assert len(hist) == 1
+        assert hist[0]["role"] == "user"
+        assert "survey.csv" in hist[0]["content"]
+        assert "TR" in hist[0]["content"]
+
+    def test_reupload_replaces_chat_history_not_appends(self, synthetic_df):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        _upload_synthetic(client, synthetic_df)
+        hist = client.get("/chat/history").json()["history"]
+        assert len(hist) == 1, "a second upload must reset chat_history, not accumulate duplicate seed turns"
+
+    def test_set_declaration_merges_not_overwrites(self, synthetic_df, monkeypatch):
+        # /upload already auto-detects and prefills construct_dict from
+        # column names -- set_declaration must add to that, not replace it,
+        # same "merge not overwrite" rule as parse_line_dict on the frontend.
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        baseline = set(client.get("/session/info").json()["constructs"])
+
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([
+            ("set_declaration", {"construct_dict": {"CUSTOM_A": ["TR1", "TR2"]}}),
+        ]))
+        r1 = client.post("/chat", json={"message": "額外加一個構面", "provider": "openai", "api_key": "fake"})
+        assert r1.status_code == 200
+        cd1 = r1.json()["construct_dict"]
+        assert cd1["CUSTOM_A"] == ["TR1", "TR2"]
+        assert baseline <= set(cd1)
+
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([
+            ("set_declaration", {"construct_dict": {"CUSTOM_B": ["PE1", "PE2"]}}),
+        ]))
+        r2 = client.post("/chat", json={"message": "再加一個構面", "provider": "openai", "api_key": "fake"})
+        cd2 = r2.json()["construct_dict"]
+        assert cd2["CUSTOM_A"] == ["TR1", "TR2"], "first custom construct must survive the second update"
+        assert cd2["CUSTOM_B"] == ["PE1", "PE2"]
+
+    def test_set_declaration_rejects_unknown_columns(self, synthetic_df, monkeypatch):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        baseline = set(client.get("/session/info").json()["constructs"])
+
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([
+            ("set_declaration", {"construct_dict": {"BAD": ["NOPE1", "NOPE2"]}}),
+        ]))
+        r = client.post("/chat", json={"message": "...", "provider": "openai", "api_key": "fake"})
+        assert r.status_code == 200
+        assert r.json()["tool_calls"][0]["result"].get("error")
+        assert set(r.json()["construct_dict"].keys()) == baseline, "rejected update must not mutate session state"
+
+    def test_set_declaration_hints_when_construct_names_used_as_items(self, synthetic_df, monkeypatch):
+        # Real-world bug: user says "ATT 由 TRU, PE, EE 組成" (ATT is composed
+        # of TRU/PE/EE) meaning a structural relationship (TRU/PE/EE predict
+        # ATT), but a model can misread it as a measurement statement and
+        # put the *construct names* into construct_dict instead of
+        # structural_model. The tool result must steer the model back to
+        # the right field so it can self-correct on the next turn.
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)  # auto-detects TR, PE, EE constructs
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([
+            ("set_declaration", {"construct_dict": {"ATT": ["TR", "PE"]}}),
+        ]))
+        r = client.post("/chat", json={"message": "ATT 由 TR, PE 組成", "provider": "openai", "api_key": "fake"})
+        error = r.json()["tool_calls"][0]["result"]["error"]
+        assert "structural_model" in error
+        assert "TR" in error and "PE" in error
+
+    def test_repeated_identical_tool_call_is_not_re_executed(self, synthetic_df, monkeypatch):
+        # If the model blindly retries the exact same failing tool call
+        # instead of correcting course, the dedupe guard in _call_llm_chat
+        # must short-circuit the repeat rather than actually re-running
+        # _execute_chat_tool (which for run_full_pipeline would also be
+        # wasteful, not just pointless).
+        import openai as openai_module
+
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+
+        call_log = []
+        original_exec = main_module._execute_chat_tool
+
+        def spy_exec(name, args, session, request):
+            call_log.append((name, args))
+            return original_exec(name, args, session, request)
+
+        monkeypatch.setattr(main_module, "_execute_chat_tool", spy_exec)
+
+        bad_args = {"construct_dict": {"BAD": ["NOPE"]}}
+
+        class _ToolCall:
+            def __init__(self, call_id, name, arguments):
+                self.id = call_id
+                self.function = type("F", (), {"name": name, "arguments": arguments})()
+
+        class _Completions:
+            def __init__(self):
+                self._queue = [
+                    [("set_declaration", bad_args)],
+                    [("set_declaration", bad_args)],  # blind retry, identical args
+                    None,  # final turn: no more tool calls, just reply
+                ]
+
+            async def create(self, **kwargs):
+                spec = self._queue.pop(0)
+                if spec is None:
+                    message = type("M", (), {"content": "先停在這裡。", "tool_calls": None})()
+                else:
+                    tool_calls = [_ToolCall(f"call_{i}", name, json.dumps(args)) for i, (name, args) in enumerate(spec)]
+                    message = type("M", (), {"content": None, "tool_calls": tool_calls})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Completion", (), {"choices": [choice]})()
+
+        class FakeAsyncOpenAI:
+            def __init__(self, *a, **kw):
+                self.chat = type("Chat", (), {"completions": _Completions()})()
+
+        monkeypatch.setattr(openai_module, "AsyncOpenAI", FakeAsyncOpenAI)
+
+        r = client.post("/chat", json={"message": "...", "provider": "openai", "api_key": "fake"})
+        assert r.status_code == 200
+
+        matching_calls = [c for c in call_log if c[0] == "set_declaration"]
+        assert len(matching_calls) == 1, "the second identical call must not reach _execute_chat_tool"
+
+        second_result = r.json()["tool_calls"][1]["result"]
+        assert second_result["error"].startswith("你剛剛已經用完全相同的參數")
+
+    def test_trim_tool_result_for_llm_strips_respondent_list(self):
+        # A 185-respondent dataset's per-row L1 breakdown alone measured
+        # ~9000 tokens serialized -- large enough to trip a provider's
+        # per-minute request-size limit on a single follow-up call within
+        # one tool-calling turn. The LLM only ever narrates the aggregate
+        # counts, so this must be stripped before re-entering the LLM
+        # conversation, without touching what callers outside the LLM loop
+        # (audit log, API response) receive.
+        result = {
+            "data_quality": {
+                "signals_used": ["mahalanobis"], "total_respondents": 3, "flagged_count": 0,
+                "flagged_indices": [], "respondents": [{"index": i, "signals_triggered": []} for i in range(3)],
+            },
+            "measurement": {"summary": {"latent_constructs": 1}},
+        }
+        trimmed = main_module._trim_tool_result_for_llm("run_full_pipeline", result)
+        assert "respondents" not in trimmed["data_quality"]
+        assert trimmed["data_quality"]["total_respondents"] == 3
+        assert trimmed["measurement"] == result["measurement"]
+        assert "respondents" in result["data_quality"], "the original dict passed in must not be mutated"
+
+    def test_run_full_pipeline_via_chat(self, synthetic_df, construct_dict, structural_model, monkeypatch):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([
+            ("set_declaration", {"construct_dict": construct_dict, "structural_model": structural_model}),
+            ("run_full_pipeline", {}),
+        ]))
+        r = client.post("/chat", json={"message": "幫我分析", "provider": "openai", "api_key": "fake"})
+        assert r.status_code == 200
+        pipeline_result = r.json()["tool_calls"][1]["result"]
+        assert pipeline_result["measurement"]["summary"]["latent_constructs"] == 3
+        assert "bootstrapping" in pipeline_result["structural"]
+
+        history = client.get("/audit/history").json()["entries"]
+        actions = {e["action"] for e in history}
+        assert {"chat_run_full_pipeline", "chat_message"} <= actions
+
+    def test_run_full_pipeline_blocked_by_l2_gate(self, monkeypatch):
+        df = TestL2Gate()._bad_and_good_df()
+        client = _make_client()
+        _upload_synthetic(client, df)
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([
+            ("set_declaration", {
+                "construct_dict": {"G": ["G1", "G2", "G3"], "N": ["N1", "N2", "N3"]},
+                "structural_model": {"G": ["N"]},
+            }),
+            ("run_full_pipeline", {}),
+        ]))
+        r = client.post("/chat", json={"message": "跑分析", "provider": "openai", "api_key": "fake"})
+        result = r.json()["tool_calls"][1]["result"]
+        assert result["structural"]["blocked_by_l2_gate"] is True
+        assert "N" in result["structural"]["blocked_constructs"]
+
+    def test_run_full_pipeline_without_upload_errors(self, monkeypatch):
+        client = _make_client()
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([
+            ("run_full_pipeline", {}),
+        ]))
+        r = client.post("/chat", json={"message": "跑分析", "provider": "openai", "api_key": "fake"})
+        assert r.json()["tool_calls"][0]["result"].get("error")
+
+    def test_rerun_optimization_via_chat_is_exploratory_and_audited(self, synthetic_df, construct_dict, structural_model, monkeypatch):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([
+            ("set_declaration", {"construct_dict": construct_dict, "structural_model": structural_model}),
+            ("rerun_optimization", {"max_drop_ratio": 0.15, "boot_iterations": 50}),
+        ]))
+        r = client.post("/chat", json={"message": "把刪除比例放寬到15%重跑", "provider": "openai", "api_key": "fake"})
+        assert r.status_code == 200
+        rerun_result = r.json()["tool_calls"][1]["result"]
+        assert "stage_a" in rerun_result
+        assert "audit_entry_id" in rerun_result
+
+        history = client.get("/audit/history").json()["entries"]
+        entry = next(e for e in history if e["action"] == "optimize_full_search")
+        assert entry["is_exploratory"] is True
+        assert entry["request_params"]["triggered_by"] == "chat"
+
+    def test_rerun_optimization_clamps_out_of_range_params(self, synthetic_df, construct_dict, structural_model, monkeypatch):
+        # An LLM could in principle propose an out-of-spec value; the same
+        # bounds /optimize/full-search enforces via Pydantic must also hold
+        # here even though the chat tool takes raw dict args, not a model.
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([
+            ("set_declaration", {"construct_dict": construct_dict, "structural_model": structural_model}),
+            ("rerun_optimization", {"max_drop_ratio": 0.99, "boot_iterations": 50}),
+        ]))
+        r = client.post("/chat", json={"message": "刪光光重跑", "provider": "openai", "api_key": "fake"})
+        entry = next(e for e in client.get("/audit/history").json()["entries"] if e["action"] == "optimize_full_search")
+        assert entry["request_params"]["max_drop_ratio"] <= 0.30
+
+    def test_chat_history_persists_and_reset_clears_it(self, synthetic_df, monkeypatch):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        monkeypatch.setattr(main_module, "_call_llm_chat", self._fake_llm([]))
+        client.post("/chat", json={"message": "第一句", "provider": "openai", "api_key": "fake"})
+        client.post("/chat", json={"message": "第二句", "provider": "openai", "api_key": "fake"})
+        hist = client.get("/chat/history").json()["history"]
+        # First entry is the seed turn /upload injects (see test_upload_seeds_chat_history_*);
+        # the two real user turns follow it.
+        user_turns = [m["content"] for m in hist if m["role"] == "user"]
+        assert user_turns[1:] == ["第一句", "第二句"]
+
+        client.post("/chat/reset")
+        assert client.get("/chat/history").json()["history"] == []
+
+    def test_chat_failure_does_not_leave_dangling_user_turn(self, synthetic_df, monkeypatch):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+
+        async def boom(**kwargs):
+            raise RuntimeError("provider unreachable")
+
+        before = client.get("/chat/history").json()["history"]
+
+        monkeypatch.setattr(main_module, "_call_llm_chat", boom)
+        r = client.post("/chat", json={"message": "hi", "provider": "openai", "api_key": "fake"})
+        assert r.status_code == 500
+        assert client.get("/chat/history").json()["history"] == before
