@@ -601,6 +601,21 @@ class TestL2Gate:
         })
         assert r.status_code == 200
 
+    def test_l2_gate_ignores_single_item_pseudo_constructs(self, synthetic_df, construct_dict, structural_model):
+        # Single-item entries (e.g. auto-detected demographic columns like
+        # "Gender": ["Gender"]) are not latent PLS-SEM constructs and were
+        # never meant to be held to an AVE/reliability standard. The gate
+        # must not block real analysis just because a control-variable
+        # column got swept into construct_dict as a 1-item group.
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        mixed_construct_dict = {**construct_dict, "Gender": ["TR1"]}  # any single existing column works as the stand-in
+        r = client.post("/analyze/structural", json={
+            "structural_model": {"PE": ["TR"]},
+            "construct_dict": mixed_construct_dict,
+        })
+        assert r.status_code == 200
+
     def test_override_without_reason_rejected(self):
         df = self._bad_and_good_df()
         client = _make_client()

@@ -4,7 +4,7 @@ import json
 
 import streamlit as st
 
-from api_client import get, is_error, post_json, show_error
+from api_client import get, is_error, parse_line_dict, post_json, show_error
 
 st.set_page_config(page_title="宣告 | Survey Co-Pilot", page_icon="📝", layout="wide")
 st.title("📝 研究設計宣告（L0）")
@@ -13,10 +13,17 @@ st.caption("上傳資料之前，先宣告構面/題項/假設路徑。這個時
 if "declaration_id" in st.session_state:
     st.success(f"目前這個 session 已經有宣告 #{st.session_state['declaration_id']}，可以直接前往「上傳」頁面，或在下方建立新的宣告覆蓋它。")
 
+uploaded_construct_dict = st.session_state.get("construct_dict")
+prefilled_measurement = ""
+if uploaded_construct_dict:
+    prefilled_measurement = "\n".join(f"{c}: {', '.join(items)}" for c, items in uploaded_construct_dict.items())
+    st.info("已經有上傳過的資料，下面的測量模型已經用自動偵測到的構面分組回填，你只要確認一下、補上結構模型（假設路徑）就好，不用重打一次。")
+
 st.subheader("測量模型（Measurement Model）")
 st.caption("每行一個構面，格式：`構面名稱: 題項1, 題項2, 題項3`")
 measurement_text = st.text_area(
-    "measurement_model", label_visibility="collapsed", height=140,
+    "measurement_model", label_visibility="collapsed", height=180,
+    value=prefilled_measurement,
     placeholder="TRU: TRU1, TRU2, TRU3\nPE: PE1, PE2, PE3\nBI: BI1, BI2, BI3",
 )
 
@@ -31,22 +38,9 @@ label = st.text_input("這次宣告的名稱／標籤（選填）", placeholder=
 notes = st.text_area("備註（選填）", height=80)
 
 
-def _parse_model(text: str) -> dict:
-    result = {}
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        key, vals = line.split(":", 1)
-        items = [v.strip() for v in vals.split(",") if v.strip()]
-        if items:
-            result[key.strip()] = items
-    return result
-
-
 if st.button("送出宣告", type="primary"):
-    measurement_model = _parse_model(measurement_text)
-    structural_model = _parse_model(structural_text)
+    measurement_model = parse_line_dict(measurement_text)
+    structural_model = parse_line_dict(structural_text)
 
     if not measurement_model:
         st.warning("請至少填寫一個構面的測量模型。")
