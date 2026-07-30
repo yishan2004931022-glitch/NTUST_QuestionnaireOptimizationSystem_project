@@ -875,6 +875,15 @@ def build_model_diagram_dot(
     Single-item entries (demographic/control columns like "Gender": ["Gender"])
     are excluded, same filter used by the L2 gate -- they were never meant
     to be latent constructs.
+
+    Each construct is drawn as ONE node with its items listed inside the
+    node's label (a few per line), rather than one node per item wired in
+    with its own edge -- the latter looked correct in isolation but with
+    ~10 constructs x 3-5 items each, dot's cluster layout stacked every
+    construct's item-cluster vertically and produced a diagram thousands
+    of pixels tall with structural arrows crossing the whole image. This
+    keeps the measurement-model information (which items belong to which
+    construct) without the layout blowing up as constructs/items scale up.
     """
     import graphviz  # local import: keeps this an optional dependency for the
     # rest of the module -- everything else must keep working even in an
@@ -883,18 +892,14 @@ def build_model_diagram_dot(
     latent = {c: items for c, items in (construct_dict or {}).items() if len(items) >= 2}
 
     g = graphviz.Digraph("model")
-    g.attr(rankdir="LR", fontname="Helvetica", nodesep="0.35", ranksep="0.9")
+    g.attr(rankdir="LR", fontname="Helvetica", nodesep="0.3", ranksep="1.0")
     g.attr("node", fontname="Helvetica")
     g.attr("edge", fontname="Helvetica")
 
     for construct, items in latent.items():
-        with g.subgraph(name=f"cluster_{construct}") as c:
-            c.attr(label=construct, style="rounded", color="#999999", fontsize="12", fontname="Helvetica")
-            c.node(construct, shape="ellipse", style="filled", fillcolor="#dbe9ff", fontsize="12")
-            for item in items:
-                item_id = f"{construct}__{item}"
-                c.node(item_id, shape="box", style="filled", fillcolor="#f5f5f5", fontsize="9", label=item)
-                c.edge(item_id, construct, arrowsize="0.6", color="#aaaaaa")
+        item_lines = [", ".join(items[i:i + 4]) for i in range(0, len(items), 4)]
+        label = "\n".join([construct] + item_lines)
+        g.node(construct, shape="box", style="rounded,filled", fillcolor="#dbe9ff", fontsize="11", label=label)
 
     if structural_model:
         for dep, indeps in structural_model.items():
