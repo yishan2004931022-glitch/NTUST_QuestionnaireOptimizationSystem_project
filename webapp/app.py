@@ -10,12 +10,14 @@ replaces the earlier multi-page Streamlit wizard by explicit request --
 the backend endpoints/gates it drives (L2 hard gate, audit_log,
 optimize_unified) are unchanged.
 """
+import io
 import os
 import uuid
 from typing import Any, Dict, List, Optional
 
 import gradio as gr
 import requests
+from PIL import Image
 
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.environ.get("API_KEY", "")
@@ -47,6 +49,21 @@ def _post(session_id: str, path: str, json_body: dict, timeout: int = 120) -> Di
 
 def _is_error(data: Dict[str, Any]) -> bool:
     return bool(data.get("__error__"))
+
+
+def _fetch_diagram(session_id: str, construct_dict: Optional[dict] = None, structural_model: Optional[dict] = None):
+    """Fetch the current construct/structural diagram as a PIL image, or None on any failure (best-effort, never blocks chat)."""
+    payload = {"construct_dict": construct_dict, "structural_model": structural_model}
+    try:
+        resp = requests.post(f"{BACKEND_URL}/diagram/image", headers=_headers(session_id), json=payload, timeout=30)
+    except requests.RequestException:
+        return None
+    if resp.status_code >= 400:
+        return None
+    try:
+        return Image.open(io.BytesIO(resp.content))
+    except Exception:
+        return None
 
 
 # ─── Formatting backend tool results into readable chat markdown ────
@@ -155,7 +172,7 @@ def _new_session_id() -> str:
 
 def on_upload(file, session_id, history):
     if file is None:
-        return history, gr.update()
+        return history, gr.update(), gr.update()
     filename = os.path.basename(file)
     with open(file, "rb") as f:
         data = f.read()
@@ -166,7 +183,7 @@ def on_upload(file, session_id, history):
         )
     except requests.RequestException as e:
         history = history + [{"role": "assistant", "content": f"❌ 連不到後端服務：{e}"}]
-        return history, gr.update()
+        return history, gr.update(), gr.update()
 
     try:
         result = resp.json()
@@ -175,7 +192,7 @@ def on_upload(file, session_id, history):
 
     if resp.status_code >= 400:
         history = history + [{"role": "assistant", "content": f"❌ 上傳失敗：{result.get('detail', '未知錯誤')}"}]
-        return history, gr.update(value=None)
+        return history, gr.update(value=None), gr.update()
 
     constructs = result.get("constructs", {})
     lines = [
@@ -185,12 +202,14 @@ def on_upload(file, session_id, history):
     lines += [f"- {c}：{', '.join(items)}" for c, items in constructs.items()]
     lines.append("接下來可以跟我說結構路徑要怎麼設定（例如：「信任會影響有用性和易用性」），或直接說「用這個分組開始分析」。")
     history = history + [{"role": "assistant", "content": "\n".join(lines)}]
-    return history, gr.update(value=None)
+
+    diagram = _fetch_diagram(session_id, construct_dict=constructs)
+    return history, gr.update(value=None), (diagram if diagram is not None else gr.update())
 
 
 def on_chat(message, history, session_id, provider, api_key, model, base_url):
     if not message or not message.strip():
-        return history, ""
+        return history, "", gr.update()
 
     history = history + [{"role": "user", "content": message}]
 
@@ -205,16 +224,26 @@ def on_chat(message, history, session_id, provider, api_key, model, base_url):
 
     if _is_error(result):
         history = history + [{"role": "assistant", "content": f"❌ {result.get('detail', '後端錯誤')}"}]
-        return history, ""
+        return history, "", gr.update()
 
     reply_parts = [result.get("reply", "")]
+    declaration_changed = False
     for tc in result.get("tool_calls", []):
         formatted = _fmt_tool_result(tc["name"], tc.get("result", {}))
         if formatted:
             reply_parts.append("---\n" + formatted)
+        if tc["name"] == "set_declaration" and tc.get("result", {}).get("success"):
+            declaration_changed = True
 
     history = history + [{"role": "assistant", "content": "\n\n".join(p for p in reply_parts if p)}]
-    return history, ""
+
+    diagram_update = gr.update()
+    if declaration_changed:
+        diagram = _fetch_diagram(session_id, construct_dict=result.get("construct_dict"), structural_model=result.get("structural_model"))
+        if diagram is not None:
+            diagram_update = diagram
+
+    return history, "", diagram_update
 
 
 def on_reset(session_id):
@@ -223,7 +252,7 @@ def on_reset(session_id):
         requests.post(f"{BACKEND_URL}/session/reset", headers=_headers(session_id), timeout=30)
     except requests.RequestException:
         pass
-    return [], _new_session_id()
+    return [], _new_session_id(), None
 
 
 with gr.Blocks(title="Survey Co-Pilot") as demo:
@@ -243,29 +272,34 @@ with gr.Blocks(title="Survey Co-Pilot") as demo:
             api_key_in = gr.Textbox(label="API Key", type="password", placeholder="留空則用後端 LLM_API_KEY")
             base_url_in = gr.Textbox(label="Base URL（選填，例如 Groq 的 OpenAI 相容端點）", placeholder="留空則用後端 LLM_BASE_URL")
 
-    chatbot = gr.Chatbot(height=520, label=None)
-
     with gr.Row():
-        file_in = gr.File(label="上傳問卷資料（CSV / Excel）", file_types=[".csv", ".xlsx"], scale=1)
-        msg_box = gr.Textbox(label="輸入訊息", placeholder="上傳資料後，直接在這裡跟我討論...", scale=3, lines=2)
+        with gr.Column(scale=2):
+            chatbot = gr.Chatbot(height=520, label=None)
 
-    with gr.Row():
-        send_btn = gr.Button("送出", variant="primary")
-        reset_btn = gr.Button("重置對話與資料")
+            with gr.Row():
+                file_in = gr.File(label="上傳問卷資料（CSV / Excel）", file_types=[".csv", ".xlsx"], scale=1)
+                msg_box = gr.Textbox(label="輸入訊息", placeholder="上傳資料後，直接在這裡跟我討論...", scale=3, lines=2)
+
+            with gr.Row():
+                send_btn = gr.Button("送出", variant="primary")
+                reset_btn = gr.Button("重置對話與資料")
+
+        with gr.Column(scale=1):
+            diagram_img = gr.Image(label="構面／結構路徑圖", height=560)
 
     demo.load(_new_session_id, inputs=None, outputs=session_state)
 
-    file_in.upload(on_upload, inputs=[file_in, session_state, chatbot], outputs=[chatbot, file_in])
+    file_in.upload(on_upload, inputs=[file_in, session_state, chatbot], outputs=[chatbot, file_in, diagram_img])
 
     send_btn.click(
         on_chat, inputs=[msg_box, chatbot, session_state, provider_in, api_key_in, model_in, base_url_in],
-        outputs=[chatbot, msg_box],
+        outputs=[chatbot, msg_box, diagram_img],
     )
     msg_box.submit(
         on_chat, inputs=[msg_box, chatbot, session_state, provider_in, api_key_in, model_in, base_url_in],
-        outputs=[chatbot, msg_box],
+        outputs=[chatbot, msg_box, diagram_img],
     )
-    reset_btn.click(on_reset, inputs=[session_state], outputs=[chatbot, session_state])
+    reset_btn.click(on_reset, inputs=[session_state], outputs=[chatbot, session_state, diagram_img])
 
 
 if __name__ == "__main__":

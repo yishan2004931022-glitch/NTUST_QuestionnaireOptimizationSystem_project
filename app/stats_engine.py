@@ -852,3 +852,63 @@ def calc_composite_score(df, construct_dict, weighting="loading"):
             "items_used": len(items),
         }
     return out
+
+
+# ─────────────────────────────────────────────
+# Model Diagram (measurement + structural path visualization)
+# ─────────────────────────────────────────────
+
+def build_model_diagram_dot(
+    construct_dict: Dict[str, List[str]],
+    structural_model: Optional[Dict[str, List[str]]] = None,
+) -> str:
+    """
+    Build a Graphviz DOT diagram of the declared model spec: constructs with
+    their reflective items (measurement model), plus structural paths
+    between constructs if a structural model is supplied.
+
+    This draws whatever is *declared* -- it does not run or depend on any
+    statistical analysis, so it's available immediately after upload
+    (construct_dict alone) and updates as soon as a structural model is
+    typed/declared, without waiting for L2/L3 to actually run.
+
+    Single-item entries (demographic/control columns like "Gender": ["Gender"])
+    are excluded, same filter used by the L2 gate -- they were never meant
+    to be latent constructs.
+    """
+    import graphviz  # local import: keeps this an optional dependency for the
+    # rest of the module -- everything else must keep working even in an
+    # environment where the graphviz package/binary isn't installed yet.
+
+    latent = {c: items for c, items in (construct_dict or {}).items() if len(items) >= 2}
+
+    g = graphviz.Digraph("model")
+    g.attr(rankdir="LR", fontname="Helvetica", nodesep="0.35", ranksep="0.9")
+    g.attr("node", fontname="Helvetica")
+    g.attr("edge", fontname="Helvetica")
+
+    for construct, items in latent.items():
+        with g.subgraph(name=f"cluster_{construct}") as c:
+            c.attr(label=construct, style="rounded", color="#999999", fontsize="12", fontname="Helvetica")
+            c.node(construct, shape="ellipse", style="filled", fillcolor="#dbe9ff", fontsize="12")
+            for item in items:
+                item_id = f"{construct}__{item}"
+                c.node(item_id, shape="box", style="filled", fillcolor="#f5f5f5", fontsize="9", label=item)
+                c.edge(item_id, construct, arrowsize="0.6", color="#aaaaaa")
+
+    if structural_model:
+        for dep, indeps in structural_model.items():
+            if dep not in latent:
+                continue
+            for indep in indeps:
+                if indep not in latent or indep == dep:
+                    continue
+                g.edge(indep, dep, color="#1a56db", penwidth="2")
+
+    return g.source
+
+
+def render_diagram_png(dot_source: str) -> bytes:
+    """Render DOT source to PNG bytes. Requires the `dot` binary (graphviz apt package)."""
+    import graphviz
+    return graphviz.Source(dot_source).pipe(format="png")

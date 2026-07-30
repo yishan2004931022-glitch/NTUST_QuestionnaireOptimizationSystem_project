@@ -27,6 +27,8 @@ from app.stats_engine import (
     detect_careless_responses,
     calc_deleted_alpha,
     calc_composite_score,
+    build_model_diagram_dot,
+    render_diagram_png,
 )
 
 from fastapi.testclient import TestClient
@@ -1329,3 +1331,81 @@ class TestChatEndpoint:
         r = client.post("/chat", json={"message": "hi", "provider": "openai", "api_key": "fake"})
         assert r.status_code == 500
         assert client.get("/chat/history").json()["history"] == before
+
+
+# ─────────────────────────────────────────────
+# Model diagram (construct/structural path visualization)
+# ─────────────────────────────────────────────
+
+class TestModelDiagramGeneration:
+    def test_includes_construct_and_item_nodes(self, construct_dict):
+        dot = build_model_diagram_dot(construct_dict)
+        for construct, items in construct_dict.items():
+            assert construct in dot
+            for item in items:
+                assert item in dot
+
+    def test_excludes_single_item_pseudo_constructs(self, construct_dict):
+        mixed = {**construct_dict, "Gender": ["Gender"]}
+        dot = build_model_diagram_dot(mixed)
+        # "Gender" the construct node shouldn't appear, but be careful: it
+        # could still appear as an *item* label under a real construct in
+        # principle, so check for the node declaration pattern instead.
+        assert 'label=Gender' not in dot.replace('"', '')
+
+    def test_no_structural_edges_without_structural_model(self, construct_dict):
+        dot = build_model_diagram_dot(construct_dict)
+        assert "#1a56db" not in dot  # the color used only for structural edges
+
+    def test_structural_edges_present_when_declared(self, construct_dict, structural_model):
+        dot = build_model_diagram_dot(construct_dict, structural_model)
+        assert "#1a56db" in dot
+        for dep, indeps in structural_model.items():
+            for indep in indeps:
+                assert f"{indep} -> {dep}" in dot.replace('"', '')
+
+    def test_structural_edge_ignores_unknown_construct(self, construct_dict):
+        dot = build_model_diagram_dot(construct_dict, {"PE": ["TR", "NOT_A_REAL_CONSTRUCT"]})
+        assert "NOT_A_REAL_CONSTRUCT" not in dot
+
+    def test_render_png_produces_real_png_bytes(self, construct_dict, structural_model):
+        dot = build_model_diagram_dot(construct_dict, structural_model)
+        png = render_diagram_png(dot)
+        assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+class TestDiagramEndpoint:
+    def test_requires_construct_data(self):
+        client = _make_client()
+        r = client.post("/diagram", json={})
+        assert r.status_code == 400
+
+    def test_uses_session_construct_dict_after_upload(self, synthetic_df):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/diagram", json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["has_structural"] is False
+        assert "TR" in body["dot"]
+
+    def test_explicit_body_overrides_session(self, synthetic_df, construct_dict, structural_model):
+        # structural_model fixture is {"PE": ["TR"], "EE": ["TR", "PE"]}
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/diagram", json={"construct_dict": construct_dict, "structural_model": structural_model})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["has_structural"] is True
+        dot = body["dot"].replace('"', '')
+        assert "TR -> PE" in dot
+        assert "TR -> EE" in dot
+        assert "PE -> EE" in dot
+
+    def test_image_endpoint_returns_png(self, synthetic_df, construct_dict):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/diagram/image", json={"construct_dict": construct_dict})
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "image/png"
+        assert r.content[:8] == b"\x89PNG\r\n\x1a\n"

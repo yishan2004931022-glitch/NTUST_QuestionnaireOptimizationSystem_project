@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
 from app.stats_engine import (
@@ -36,6 +36,8 @@ from app.stats_engine import (
     calc_composite_score,
     calc_reverse_item_flags,
     calc_item_stems,
+    build_model_diagram_dot,
+    render_diagram_png,
 )
 from app.r_bridge import run_efa, run_seminr, RBridgeError
 from app.session_store import save_session, load_session, clear_session
@@ -356,6 +358,11 @@ class ChatInput(BaseModel):
     base_url: Optional[str] = None
     temperature: Optional[float] = 0.3
     max_tokens: Optional[int] = 1500
+
+
+class DiagramInput(BaseModel):
+    construct_dict: Optional[Dict[str, List[str]]] = None
+    structural_model: Optional[Dict[str, List[str]]] = None
 
 
 # ─── Upload ──────────────────────────────────────────────────────
@@ -1724,6 +1731,40 @@ async def chat_reset(request: Request):
     session = _get_user_session(request)
     session["chat_history"] = []
     return {"success": True}
+
+
+# ─── Model diagram ─────────────────────────────────────────────────
+# Draws whatever construct_dict/structural_model is currently declared --
+# not tied to any analysis having run. Available right after /upload
+# (construct_dict alone) and updates as soon as a structural model is
+# typed/declared. Not logged to audit_log: pure visualization, not an
+# analysis or optimization decision.
+
+def _resolve_diagram_inputs(request: Request, body: "DiagramInput"):
+    session = _get_user_session(request)
+    construct_dict = body.construct_dict or session.get("construct_dict") or {}
+    structural_model = body.structural_model if body.structural_model is not None else session.get("chat_structural_model")
+    if not construct_dict:
+        raise HTTPException(status_code=400, detail="沒有構面資料可以畫圖，請先上傳資料或提供 construct_dict")
+    return construct_dict, structural_model
+
+
+@app.post("/diagram")
+async def diagram(request: Request, body: DiagramInput):
+    construct_dict, structural_model = _resolve_diagram_inputs(request, body)
+    dot = build_model_diagram_dot(construct_dict, structural_model)
+    return {"dot": dot, "constructs": len(construct_dict), "has_structural": bool(structural_model)}
+
+
+@app.post("/diagram/image")
+async def diagram_image(request: Request, body: DiagramInput):
+    construct_dict, structural_model = _resolve_diagram_inputs(request, body)
+    dot = build_model_diagram_dot(construct_dict, structural_model)
+    try:
+        png_bytes = render_diagram_png(dot)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"圖表渲染失敗：{e}")
+    return Response(content=png_bytes, media_type="image/png")
 
 
 @app.get("/session/info")
