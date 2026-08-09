@@ -205,6 +205,8 @@ def on_upload(file, session_id, history):
         lines.append("檔案裡也附了 structural_model 工作表，讀到的結構路徑：")
         lines += [f"- {dep} ← {', '.join(indeps)}" for dep, indeps in structural.items()]
         lines.append("這組路徑已經直接生效，可以跟我說「開始分析」，或先討論要不要調整。")
+        if result.get("auto_declared"):
+            lines.append(f"（系統已自動建立宣告 #{result.get('declaration_id')}，作為驗證性分析的時間基準點，不用再另外宣告一次。）")
     else:
         lines.append("接下來可以跟我說結構路徑要怎麼設定（例如：「信任會影響有用性和易用性」），或直接說「用這個分組開始分析」。")
     history = history + [{"role": "assistant", "content": "\n".join(lines)}]

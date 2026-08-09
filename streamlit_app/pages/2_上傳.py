@@ -26,7 +26,11 @@ if uploaded is not None:
             st.session_state["construct_dict"] = result["constructs"]
             if result.get("structural_model"):
                 st.session_state["declared_structural_model"] = result["structural_model"]
+            if result.get("declaration_id"):
+                st.session_state["declaration_id"] = result["declaration_id"]
             st.success(result["message"])
+            if result.get("auto_declared"):
+                st.info(f"這份檔案同時有構面跟結構路徑，系統已經自動幫你建立宣告 #{result['declaration_id']}，不用再去「宣告」頁面手動輸入一次。")
             col1, col2 = st.columns(2)
             col1.metric("樣本數", result["rows"])
             col2.metric("偵測到的構面數", len(result["constructs"]))

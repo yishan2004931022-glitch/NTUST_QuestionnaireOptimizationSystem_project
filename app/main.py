@@ -380,6 +380,20 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         df, construct_dict, structural_model = load_data(tmp_path)
         user_id = _resolve_user_id(request)
         declaration_id = _get_user_session(request).get("declaration_id")
+        auto_declaration = None
+        if declaration_id is None and structural_model:
+            # If the upload itself already carries a complete theory (auto-
+            # detected constructs + a structural_model sheet), that upload
+            # IS the confirmatory baseline -- there's no need to make the
+            # researcher separately retype what they already wrote into the
+            # file. This only fires when nothing was declared yet this
+            # session; an existing manual declaration is never overwritten.
+            auto_declaration = audit_db.create_declaration(
+                user_id, construct_dict, structural_model,
+                label=f"自動宣告（上傳 {file.filename} 時建立）",
+                notes="從上傳檔案的 structural_model 工作表自動產生，未經使用者手動輸入確認。",
+            )
+            declaration_id = auto_declaration["id"]
         dataset_record = audit_db.record_dataset(user_id, df, filename=file.filename, declaration_id=declaration_id)
         session = {
             "df": df,
@@ -407,6 +421,8 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 "。這份檔案裡也附了結構路徑宣告（structural_model 工作表）："
                 + "；".join(f"{dep} ← {', '.join(indeps)}" for dep, indeps in structural_model.items())
             )
+        if auto_declaration:
+            chat_seed += f"。系統已經自動建立宣告 #{auto_declaration['id']}（時間戳記：{auto_declaration['created_at']}），作為驗證性分析的基準點。"
         chat_seed += "。之後的對話請根據這份已上傳的資料回答，不用再問我有沒有上傳資料。"
         _get_user_session(request)["chat_history"] = [{"role": "user", "content": chat_seed}]
         save_session(df, construct_dict, request=request)
@@ -417,6 +433,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             result_summary={
                 "rows": len(df), "columns": len(df.columns), "constructs": list(construct_dict.keys()),
                 "structural_model": structural_model, "file_hash": dataset_record["file_hash"],
+                "auto_declaration_id": auto_declaration["id"] if auto_declaration else None,
             },
             is_exploratory=False,
         )
@@ -425,12 +442,15 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "rows": len(df),
             "columns": len(df.columns),
             "constructs": {k: v for k, v in construct_dict.items()},
+            "declaration_id": declaration_id,
+            "auto_declared": auto_declaration is not None,
             "structural_model": structural_model,
             "all_columns": df.columns.tolist(),
             "dataset_id": dataset_record["id"],
             "message": (
                 f"成功載入 {len(df)} 份問卷，偵測到 {len(construct_dict)} 個構面"
-                + (f"，並讀到 {len(structural_model)} 條結構路徑宣告。" if structural_model else "。")
+                + (f"，並讀到 {len(structural_model)} 條結構路徑宣告" if structural_model else "")
+                + (f"，已自動建立宣告 #{auto_declaration['id']}（作為驗證性分析基準點）。" if auto_declaration else "。")
             ),
         }
     except Exception as e:

@@ -1500,8 +1500,58 @@ class TestStructuralModelSheet:
         hist = client.get("/chat/history").json()["history"]
         assert "結構路徑宣告" in hist[0]["content"]
 
-    def test_csv_upload_still_returns_null_structural_model(self, synthetic_df):
+    def test_upload_with_structural_sheet_auto_declares(self, synthetic_df):
+        # A complete theory (constructs + structural paths) arriving in one
+        # upload with nothing declared yet this session IS the confirmatory
+        # baseline -- no need to make the researcher retype what they
+        # already wrote into the file.
+        rows = [{"dependent": "PE", "independent": "TR"}]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        client = _make_client()
+        with open(path, "rb") as f:
+            r = client.post(
+                "/upload",
+                files={"file": ("survey.xlsx", f.read(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            )
+        body = r.json()
+        assert body["auto_declared"] is True
+        assert body["declaration_id"] is not None
+        assert "自動建立宣告" in body["message"]
+
+        declaration = client.get(f"/declare/{body['declaration_id']}").json()
+        assert declaration["structural_model"] == {"PE": ["TR"]}
+
+        # It must also be a real, audited declaration -- not just a
+        # cosmetic response field -- so a later dataset/audit entry can
+        # trace back to it the same way a manual declaration would.
+        history = client.get("/audit/history").json()["entries"]
+        upload_entry = next(e for e in history if e["action"] == "upload")
+        assert upload_entry["declaration_id"] == body["declaration_id"]
+
+    def test_upload_does_not_overwrite_existing_manual_declaration(self, synthetic_df):
+        rows = [{"dependent": "PE", "independent": "TR"}]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        client = _make_client()
+
+        manual = client.post("/declare", json={
+            "measurement_model": {"TR": ["TR1", "TR2"]},
+            "structural_model": {"EE": ["TR"]},
+        })
+        manual_id = manual.json()["id"]
+
+        with open(path, "rb") as f:
+            r = client.post(
+                "/upload",
+                files={"file": ("survey.xlsx", f.read(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            )
+        body = r.json()
+        assert body["auto_declared"] is False
+        assert body["declaration_id"] == manual_id
+
+    def test_csv_upload_without_structural_sheet_does_not_auto_declare(self, synthetic_df):
         client = _make_client()
         r = _upload_synthetic(client, synthetic_df)
-        assert r.status_code == 200
-        assert r.json()["structural_model"] is None
+        body = r.json()
+        assert body["structural_model"] is None
+        assert body["auto_declared"] is False
+        assert body["declaration_id"] is None
