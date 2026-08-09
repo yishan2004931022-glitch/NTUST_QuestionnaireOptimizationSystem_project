@@ -4,7 +4,7 @@ import json
 
 import streamlit as st
 
-from api_client import get, is_error, parse_line_dict, post_json, show_error
+from api_client import get, is_error, parse_line_dict, post_json, show_diagram, show_error
 
 st.set_page_config(page_title="宣告 | Survey Co-Pilot", page_icon="📝", layout="wide")
 st.title("📝 研究設計宣告（L0）")
@@ -54,14 +54,7 @@ parsed_structural_preview = parse_line_dict(structural_text) if structural_text.
 if parsed_measurement_preview:
     st.subheader("架構圖預覽")
     st.caption("依目前輸入即時預覽，不代表已經送出宣告或跑過分析。")
-    diagram = post_json("/diagram", {
-        "construct_dict": parsed_measurement_preview,
-        "structural_model": parsed_structural_preview or None,
-    })
-    if is_error(diagram):
-        show_error(diagram)
-    else:
-        st.graphviz_chart(diagram["dot"])
+    show_diagram(parsed_measurement_preview, parsed_structural_preview, key="diagram_declare")
 
 label = st.text_input("這次宣告的名稱／標籤（選填）", placeholder="例如：正式問卷 v1")
 notes = st.text_area("備註（選填）", height=80)

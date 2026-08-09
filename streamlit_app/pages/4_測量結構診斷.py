@@ -3,7 +3,7 @@
 import pandas as pd
 import streamlit as st
 
-from api_client import has_uploaded_data, is_error, parse_line_dict, post_json, show_error
+from api_client import has_uploaded_data, is_error, parse_line_dict, post_json, show_diagram, show_error
 
 st.set_page_config(page_title="測量／結構診斷 | Survey Co-Pilot", page_icon="📊", layout="wide")
 st.title("📊 測量／結構模型診斷（L2 / L3）")
@@ -142,11 +142,7 @@ if structural_text.strip():
 
     st.subheader("架構圖預覽")
     st.caption("依目前輸入即時預覽，還沒送出分析也會更新；不代表已經跑過統計檢定，純粹是把宣告的構面與路徑畫出來。")
-    diagram = post_json("/diagram", {"construct_dict": construct_dict or None, "structural_model": parsed_structural})
-    if is_error(diagram):
-        show_error(diagram)
-    else:
-        st.graphviz_chart(diagram["dot"])
+    show_diagram(construct_dict, parsed_structural, key="diagram_l3")
 
 use_seminr = st.checkbox("用 R/seminr 算完整版（含 HTMT、f²、Q²predict，較慢）", value=False)
 

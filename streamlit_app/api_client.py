@@ -102,12 +102,44 @@ def post_file(path: str, filename: str, file_bytes: bytes, timeout: int = 60) ->
     return _handle(resp)
 
 
-def is_error(data: Dict[str, Any]) -> bool:
-    return bool(data.get("__error__"))
+def post_json_for_bytes(path: str, payload: Dict[str, Any], timeout: int = 60):
+    """POST JSON, expect a binary response body (e.g. image/png). Returns raw bytes, or an error dict."""
+    try:
+        resp = requests.post(
+            f"{BACKEND_URL}{path}", headers=_headers({"Content-Type": "application/json"}),
+            json=payload, timeout=timeout,
+        )
+    except requests.RequestException as e:
+        return {"__error__": True, "detail": f"連不到後端服務：{e}"}
+    if resp.status_code >= 400:
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"detail": resp.text}
+        return {**data, "__error__": True, "__status__": resp.status_code}
+    return resp.content
+
+
+def is_error(data) -> bool:
+    return isinstance(data, dict) and bool(data.get("__error__"))
 
 
 def show_error(data: Dict[str, Any]) -> None:
     st.error(data.get("detail") or data.get("message") or "後端回傳錯誤，請檢查伺服器狀態。")
+
+
+def show_diagram(construct_dict: Dict[str, List[str]], structural_model: Optional[Dict[str, List[str]]] = None, key: str = "diagram") -> None:
+    """Render the construct/structural diagram plus a PNG download button. Shared by every page that shows one, so the download wiring only exists in one place."""
+    payload = {"construct_dict": construct_dict, "structural_model": structural_model or None}
+    diagram = post_json("/diagram", payload)
+    if is_error(diagram):
+        show_error(diagram)
+        return
+    st.graphviz_chart(diagram["dot"])
+
+    png = post_json_for_bytes("/diagram/image", payload)
+    if not is_error(png):
+        st.download_button("下載架構圖（PNG）", data=png, file_name="construct_diagram.png", mime="image/png", key=key)
 
 
 def has_uploaded_data() -> bool:

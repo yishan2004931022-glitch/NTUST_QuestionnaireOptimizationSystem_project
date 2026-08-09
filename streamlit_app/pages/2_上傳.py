@@ -2,7 +2,7 @@
 """Upload questionnaire data and preview auto-detected construct grouping."""
 import streamlit as st
 
-from api_client import is_error, post_file, post_json, show_error
+from api_client import is_error, post_file, show_diagram, show_error
 
 st.set_page_config(page_title="上傳 | Survey Co-Pilot", page_icon="📤", layout="wide")
 st.title("📤 上傳問卷資料")
@@ -53,14 +53,7 @@ if "construct_dict" in st.session_state:
         st.caption("包含從檔案讀到／已宣告的結構路徑。")
     else:
         st.caption("這裡只畫出目前已知的構面／題項，還沒有結構路徑（可以在檔案裡附 structural_model 工作表，或到「宣告」/「測量／結構診斷」頁面手動宣告後才會出現連線）。")
-    diagram = post_json("/diagram", {
-        "construct_dict": st.session_state["construct_dict"],
-        "structural_model": declared_structural or None,
-    })
-    if is_error(diagram):
-        show_error(diagram)
-    else:
-        st.graphviz_chart(diagram["dot"])
+    show_diagram(st.session_state["construct_dict"], declared_structural, key="diagram_upload")
 
     st.divider()
     st.subheader("目前 session 記得的構面分組")
