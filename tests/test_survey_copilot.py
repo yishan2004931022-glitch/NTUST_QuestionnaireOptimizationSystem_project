@@ -15,6 +15,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from app.stats_engine import (
+    load_data,
     calc_cronbach,
     calc_loadings_ave_cr,
     calc_cross_loadings,
@@ -1409,3 +1410,98 @@ class TestDiagramEndpoint:
         assert r.status_code == 200
         assert r.headers["content-type"] == "image/png"
         assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+# ─────────────────────────────────────────────
+# Structural model read from an .xlsx "structural_model" sheet
+#
+# Structural paths are a researcher's theoretical hypothesis, not
+# something derivable from response data -- this is the one exception,
+# and it only works because the researcher explicitly wrote a second
+# sheet into the same workbook, not because anything was inferred from
+# respondents' answers.
+# ─────────────────────────────────────────────
+
+class TestStructuralModelSheet:
+    def _build_xlsx(self, data_df, structural_rows=None, sheet_name="structural_model"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+            with pd.ExcelWriter(tmp.name, engine="openpyxl") as writer:
+                data_df.to_excel(writer, index=False, sheet_name="Sheet1")
+                if structural_rows is not None:
+                    pd.DataFrame(structural_rows).to_excel(writer, index=False, sheet_name=sheet_name)
+            return tmp.name
+
+    def test_csv_has_no_structural_model(self, synthetic_df):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+            synthetic_df.to_csv(tmp.name, index=False)
+            _, _, structural_model = load_data(tmp.name)
+        assert structural_model is None
+
+    def test_xlsx_without_second_sheet_has_no_structural_model(self, synthetic_df):
+        path = self._build_xlsx(synthetic_df, structural_rows=None)
+        _, _, structural_model = load_data(path)
+        assert structural_model is None
+
+    def test_parses_structural_model_sheet_and_merges_repeated_dependents(self, synthetic_df):
+        rows = [
+            {"dependent": "PE", "independent": "TR"},
+            {"dependent": "EE", "independent": "TR"},
+            {"dependent": "EE", "independent": "PE"},
+        ]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        _, _, structural_model = load_data(path)
+        assert structural_model == {"PE": ["TR"], "EE": ["TR", "PE"]}
+
+    def test_sheet_name_and_column_names_are_case_insensitive(self, synthetic_df):
+        rows = [{"Dependent": "PE", "Independent": "TR"}]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows, sheet_name="Structural_Model")
+        _, _, structural_model = load_data(path)
+        assert structural_model == {"PE": ["TR"]}
+
+    def test_ignores_blank_rows_in_structural_sheet(self, synthetic_df):
+        rows = [
+            {"dependent": "PE", "independent": "TR"},
+            {"dependent": None, "independent": None},
+        ]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        _, _, structural_model = load_data(path)
+        assert structural_model == {"PE": ["TR"]}
+
+    def test_missing_expected_columns_returns_none_not_error(self, synthetic_df):
+        rows = [{"from": "TR", "to": "PE"}]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        _, _, structural_model = load_data(path)
+        assert structural_model is None
+
+    def test_upload_endpoint_returns_and_seeds_structural_model(self, synthetic_df):
+        rows = [
+            {"dependent": "PE", "independent": "TR"},
+            {"dependent": "EE", "independent": "TR"},
+            {"dependent": "EE", "independent": "PE"},
+        ]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        client = _make_client()
+        with open(path, "rb") as f:
+            r = client.post(
+                "/upload",
+                files={"file": ("survey.xlsx", f.read(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["structural_model"] == {"PE": ["TR"], "EE": ["TR", "PE"]}
+        assert "結構路徑" in body["message"]
+
+        # /diagram with no explicit structural_model in the body must fall
+        # back to what /upload already stored in the session.
+        diagram = client.post("/diagram", json={})
+        assert diagram.status_code == 200
+        assert diagram.json()["has_structural"] is True
+
+        hist = client.get("/chat/history").json()["history"]
+        assert "結構路徑宣告" in hist[0]["content"]
+
+    def test_csv_upload_still_returns_null_structural_model(self, synthetic_df):
+        client = _make_client()
+        r = _upload_synthetic(client, synthetic_df)
+        assert r.status_code == 200
+        assert r.json()["structural_model"] is None

@@ -195,15 +195,21 @@ def on_upload(file, session_id, history):
         return history, gr.update(value=None), gr.update()
 
     constructs = result.get("constructs", {})
+    structural = result.get("structural_model")
     lines = [
         f"✅ 已上傳「{filename}」：{result.get('rows')} 筆資料、{result.get('columns')} 個欄位。",
         "自動偵測到的構面分組（可以直接沿用，也可以跟我說要怎麼調整）：",
     ]
     lines += [f"- {c}：{', '.join(items)}" for c, items in constructs.items()]
-    lines.append("接下來可以跟我說結構路徑要怎麼設定（例如：「信任會影響有用性和易用性」），或直接說「用這個分組開始分析」。")
+    if structural:
+        lines.append("檔案裡也附了 structural_model 工作表，讀到的結構路徑：")
+        lines += [f"- {dep} ← {', '.join(indeps)}" for dep, indeps in structural.items()]
+        lines.append("這組路徑已經直接生效，可以跟我說「開始分析」，或先討論要不要調整。")
+    else:
+        lines.append("接下來可以跟我說結構路徑要怎麼設定（例如：「信任會影響有用性和易用性」），或直接說「用這個分組開始分析」。")
     history = history + [{"role": "assistant", "content": "\n".join(lines)}]
 
-    diagram = _fetch_diagram(session_id, construct_dict=constructs)
+    diagram = _fetch_diagram(session_id, construct_dict=constructs, structural_model=structural)
     return history, gr.update(value=None), (diagram if diagram is not None else gr.update())
 
 

@@ -28,11 +28,40 @@ measurement_text = st.text_area(
 )
 
 st.subheader("結構模型（Structural Model）")
-st.caption("每行一條依變數的所有前因，格式：`依變數: 自變數1, 自變數2`")
+st.caption(
+    "每行一條依變數的所有前因，格式：`依變數: 自變數1, 自變數2`。"
+    "結構路徑是研究者的理論假設，沒辦法從問卷回答的數字反推出來，"
+    "所以沒有「自動偵測」，但可以直接上傳一份寫好的宣告檔，格式跟下面文字框一樣。"
+)
+
+structural_file = st.file_uploader(
+    "上傳結構路徑宣告檔（.txt，選填）：一行一個依變數，例如 `BI: TRU, PE`",
+    type=["txt"], key="structural_file_uploader",
+)
+default_structural_text = st.session_state.get("structural_text_prefill", "")
+if structural_file is not None:
+    default_structural_text = structural_file.read().decode("utf-8")
+    st.session_state["structural_text_prefill"] = default_structural_text
+
 structural_text = st.text_area(
     "structural_model", label_visibility="collapsed", height=100,
+    value=default_structural_text,
     placeholder="BI: TRU, PE",
 )
+
+parsed_measurement_preview = parse_line_dict(measurement_text) if measurement_text.strip() else {}
+parsed_structural_preview = parse_line_dict(structural_text) if structural_text.strip() else {}
+if parsed_measurement_preview:
+    st.subheader("架構圖預覽")
+    st.caption("依目前輸入即時預覽，不代表已經送出宣告或跑過分析。")
+    diagram = post_json("/diagram", {
+        "construct_dict": parsed_measurement_preview,
+        "structural_model": parsed_structural_preview or None,
+    })
+    if is_error(diagram):
+        show_error(diagram)
+    else:
+        st.graphviz_chart(diagram["dot"])
 
 label = st.text_input("這次宣告的名稱／標籤（選填）", placeholder="例如：正式問卷 v1")
 notes = st.text_area("備註（選填）", height=80)

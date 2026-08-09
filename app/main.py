@@ -377,7 +377,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        df, construct_dict = load_data(tmp_path)
+        df, construct_dict, structural_model = load_data(tmp_path)
         user_id = _resolve_user_id(request)
         declaration_id = _get_user_session(request).get("declaration_id")
         dataset_record = audit_db.record_dataset(user_id, df, filename=file.filename, declaration_id=declaration_id)
@@ -388,6 +388,8 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "dataset_id": dataset_record["id"],
             "declaration_id": declaration_id,
         }
+        if structural_model:
+            session["chat_structural_model"] = structural_model
         _set_user_session(request, session)
         # The frontend shows a friendly "已上傳..." bubble immediately without
         # round-tripping through the LLM (fast, free), but that bubble is
@@ -395,21 +397,27 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         # so the very first real /chat call had zero grounding that data
         # existed and the model would just guess. Seeding chat_history here
         # means every chat call in this session starts with real context.
-        _get_user_session(request)["chat_history"] = [{
-            "role": "user",
-            "content": (
-                f"（系統提示，非使用者本人輸入）我剛剛上傳了問卷資料「{file.filename}」，"
-                f"{len(df)} 筆、{len(df.columns)} 個欄位。自動偵測到的構面分組："
-                + "；".join(f"{c}: {', '.join(items)}" for c, items in construct_dict.items())
-                + "。之後的對話請根據這份已上傳的資料回答，不用再問我有沒有上傳資料。"
-            ),
-        }]
+        chat_seed = (
+            f"（系統提示，非使用者本人輸入）我剛剛上傳了問卷資料「{file.filename}」，"
+            f"{len(df)} 筆、{len(df.columns)} 個欄位。自動偵測到的構面分組："
+            + "；".join(f"{c}: {', '.join(items)}" for c, items in construct_dict.items())
+        )
+        if structural_model:
+            chat_seed += (
+                "。這份檔案裡也附了結構路徑宣告（structural_model 工作表）："
+                + "；".join(f"{dep} ← {', '.join(indeps)}" for dep, indeps in structural_model.items())
+            )
+        chat_seed += "。之後的對話請根據這份已上傳的資料回答，不用再問我有沒有上傳資料。"
+        _get_user_session(request)["chat_history"] = [{"role": "user", "content": chat_seed}]
         save_session(df, construct_dict, request=request)
         audit_db.log_action(
             user_id, "upload",
             dataset_id=dataset_record["id"], declaration_id=declaration_id,
             request_params={"filename": file.filename},
-            result_summary={"rows": len(df), "columns": len(df.columns), "constructs": list(construct_dict.keys()), "file_hash": dataset_record["file_hash"]},
+            result_summary={
+                "rows": len(df), "columns": len(df.columns), "constructs": list(construct_dict.keys()),
+                "structural_model": structural_model, "file_hash": dataset_record["file_hash"],
+            },
             is_exploratory=False,
         )
         return {
@@ -417,9 +425,13 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "rows": len(df),
             "columns": len(df.columns),
             "constructs": {k: v for k, v in construct_dict.items()},
+            "structural_model": structural_model,
             "all_columns": df.columns.tolist(),
             "dataset_id": dataset_record["id"],
-            "message": f"成功載入 {len(df)} 份問卷，偵測到 {len(construct_dict)} 個構面。",
+            "message": (
+                f"成功載入 {len(df)} 份問卷，偵測到 {len(construct_dict)} 個構面"
+                + (f"，並讀到 {len(structural_model)} 條結構路徑宣告。" if structural_model else "。")
+            ),
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"檔案解析失敗：{e}")

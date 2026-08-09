@@ -18,8 +18,46 @@ from typing import Dict, List, Tuple, Optional
 # PHASE 0: Data Ingestion
 # ─────────────────────────────────────────────
 
-def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
-    """Load Excel/CSV and auto-detect construct dictionary from column names."""
+def _parse_structural_sheet(sm_df: pd.DataFrame) -> Optional[Dict[str, List[str]]]:
+    """
+    Parse a "structural_model" Excel sheet: one row per (dependent,
+    independent) pair, columns named `dependent` / `independent`
+    (case-insensitive). Multiple rows with the same dependent accumulate
+    into that dependent's independent list -- same merge-not-overwrite
+    rule as the text-line declaration format elsewhere in this app.
+    """
+    cols = {str(c).strip().lower(): c for c in sm_df.columns}
+    dep_col, indep_col = cols.get("dependent"), cols.get("independent")
+    if not dep_col or not indep_col:
+        return None
+
+    structural_model: Dict[str, List[str]] = {}
+    for _, row in sm_df.iterrows():
+        dep = str(row[dep_col]).strip()
+        indep = str(row[indep_col]).strip()
+        if not dep or not indep or dep.lower() == "nan" or indep.lower() == "nan":
+            continue
+        existing = structural_model.setdefault(dep, [])
+        if indep not in existing:
+            existing.append(indep)
+
+    return structural_model or None
+
+
+def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]], Optional[Dict[str, List[str]]]]:
+    """
+    Load Excel/CSV and auto-detect construct dictionary from column names.
+
+    If the file is an .xlsx workbook with a second sheet named
+    "structural_model" (case-insensitive), also parse that sheet into a
+    structural_model dict -- see _parse_structural_sheet() for the
+    expected columns. Structural paths are a researcher's theoretical
+    hypothesis, not something derivable from response data, so this is
+    the one exception to "auto-detect from the data": it only works
+    because the researcher explicitly wrote it into a second sheet of the
+    same file, not because it was inferred from respondents' answers.
+    CSV files and single-sheet Excel files simply return None here.
+    """
     encodings = ["utf-8-sig", "utf-8", "latin1", "cp1252", "big5"]
     df = None
     last_err = None
@@ -57,7 +95,17 @@ def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
     if not construct_dict and plain_items:
         construct_dict = plain_items
 
-    return df, construct_dict
+    structural_model = None
+    if not filepath.endswith(".csv"):
+        try:
+            xl = pd.ExcelFile(filepath)
+            sheet_lookup = {s.strip().lower(): s for s in xl.sheet_names}
+            if "structural_model" in sheet_lookup:
+                structural_model = _parse_structural_sheet(xl.parse(sheet_lookup["structural_model"]))
+        except Exception:
+            structural_model = None
+
+    return df, construct_dict, structural_model
 
 
 # ─────────────────────────────────────────────
