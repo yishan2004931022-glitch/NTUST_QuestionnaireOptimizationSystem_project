@@ -22,7 +22,11 @@ jobs:
       - run: pip install -r requirements.txt
       - run: pytest
 
-  docker:
+  # Builds the API image AND boots it -- a clean `docker build` does not
+  # guarantee the container actually starts and serves traffic (e.g. a
+  # broken CMD or a startup-time crash would build fine and only fail at
+  # runtime), so this also curls /health against the running container.
+  docker-api:
     runs-on: ubuntu-latest
     needs: test
     steps:
@@ -32,7 +36,59 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          tags: survey-copilot:${{ github.sha }}
+          tags: survey-copilot-api:${{ github.sha }}
+          push: false
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Boot smoke test
+        run: |
+          docker run -d --name api-smoke -p 8000:8000 survey-copilot-api:${{ github.sha }}
+          ok=""
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health >/dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          if [ -z "$ok" ]; then
+            echo "API never became healthy -- container logs:"
+            docker logs api-smoke
+            exit 1
+          fi
+          echo "API healthy"
+      - name: Stop container
+        if: always()
+        run: docker stop api-smoke 2>/dev/null || true
+
+  # Build-only checks for the two frontend images -- these depend on the
+  # API being reachable to do anything meaningful at runtime, so a full
+  # boot+integration test isn't worth the CI complexity here; confirming
+  # they still build in a clean environment is the useful signal.
+  docker-streamlit:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.streamlit
+          tags: survey-copilot-streamlit:${{ github.sha }}
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  docker-gradio:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.gradio
+          tags: survey-copilot-gradio:${{ github.sha }}
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -43,7 +99,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: r-lib/actions/setup-r@v2
-      - run: Rscript -e 'options(repos="https://cloud.r-project.org"); install.packages(c("psych","magrittr"), dependencies=TRUE)'
-      - run: Rscript r/efa_wrapper.R <(printf 'a,b\n1,2\n2,3\n') /tmp/efa_out.json 2
-        continue-on-error: true
-      - run: test -f /tmp/efa_out.json
+      - run: Rscript -e 'options(repos="https://cloud.r-project.org"); install.packages(c("psych","magrittr","seminr"), dependencies=TRUE)'
+
+      - name: EFA smoke test
+        run: |
+          Rscript r/efa_wrapper.R <(printf 'a,b\n1,2\n2,3\n') /tmp/efa_out.json 2
+          test -f /tmp/efa_out.json
+
+      # efa_wrapper.R alone never exercises seminr -- this project's "full
+      # version" PLS-SEM path (HTMT/f-squared/Q2predict, see
+      # PROFESSOR_REPORT.md 2.4) has broken on a seminr version bump before
+      # (see DEVELOPMENT_LOG.md) with nothing in CI to catch it.
+      - name: seminr smoke test
+        run: |
+          Rscript -e '
+          set.seed(1)
+          n <- 50
+          fA <- rnorm(n)
+          fB <- rnorm(n)
+          df <- data.frame(
+            A1 = fA + rnorm(n, sd = 0.3), A2 = fA + rnorm(n, sd = 0.3),
+            B1 = fB + rnorm(n, sd = 0.3), B2 = fB + rnorm(n, sd = 0.3)
+          )
+          write.csv(df, "/tmp/seminr_smoke.csv", row.names = FALSE)
+          '
+          Rscript r/seminr_wrapper.R /tmp/seminr_smoke.csv /tmp/seminr_out.json \
+            '{"measurement":{"A":["A1","A2"],"B":["B1","B2"]},"structural":{"B":["A"]}}' 50
+          python3 -c '
+          import json
+          with open("/tmp/seminr_out.json") as f:
+              d = json.load(f)
+          if d.get("error"):
+              raise SystemExit("seminr_wrapper.R reported an error: " + str(d["error"]))
+          if not d.get("paths"):
+              raise SystemExit("no structural paths in seminr output: " + str(d))
+          print("seminr smoke OK, paths:", list(d["paths"].keys()))
+          '
