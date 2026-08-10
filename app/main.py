@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
 from app.stats_engine import (
@@ -36,6 +36,8 @@ from app.stats_engine import (
     calc_composite_score,
     calc_reverse_item_flags,
     calc_item_stems,
+    build_model_diagram_dot,
+    render_diagram_png,
 )
 from app.r_bridge import run_efa, run_seminr, RBridgeError
 from app.session_store import save_session, load_session, clear_session
@@ -358,6 +360,11 @@ class ChatInput(BaseModel):
     max_tokens: Optional[int] = 1500
 
 
+class DiagramInput(BaseModel):
+    construct_dict: Optional[Dict[str, List[str]]] = None
+    structural_model: Optional[Dict[str, List[str]]] = None
+
+
 # ─── Upload ──────────────────────────────────────────────────────
 
 @app.post("/upload")
@@ -370,9 +377,23 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        df, construct_dict = load_data(tmp_path)
+        df, construct_dict, structural_model = load_data(tmp_path)
         user_id = _resolve_user_id(request)
         declaration_id = _get_user_session(request).get("declaration_id")
+        auto_declaration = None
+        if declaration_id is None and structural_model:
+            # If the upload itself already carries a complete theory (auto-
+            # detected constructs + a structural_model sheet), that upload
+            # IS the confirmatory baseline -- there's no need to make the
+            # researcher separately retype what they already wrote into the
+            # file. This only fires when nothing was declared yet this
+            # session; an existing manual declaration is never overwritten.
+            auto_declaration = audit_db.create_declaration(
+                user_id, construct_dict, structural_model,
+                label=f"自動宣告（上傳 {file.filename} 時建立）",
+                notes="從上傳檔案的 structural_model 工作表自動產生，未經使用者手動輸入確認。",
+            )
+            declaration_id = auto_declaration["id"]
         dataset_record = audit_db.record_dataset(user_id, df, filename=file.filename, declaration_id=declaration_id)
         session = {
             "df": df,
@@ -381,6 +402,8 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "dataset_id": dataset_record["id"],
             "declaration_id": declaration_id,
         }
+        if structural_model:
+            session["chat_structural_model"] = structural_model
         _set_user_session(request, session)
         # The frontend shows a friendly "已上傳..." bubble immediately without
         # round-tripping through the LLM (fast, free), but that bubble is
@@ -388,21 +411,30 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         # so the very first real /chat call had zero grounding that data
         # existed and the model would just guess. Seeding chat_history here
         # means every chat call in this session starts with real context.
-        _get_user_session(request)["chat_history"] = [{
-            "role": "user",
-            "content": (
-                f"（系統提示，非使用者本人輸入）我剛剛上傳了問卷資料「{file.filename}」，"
-                f"{len(df)} 筆、{len(df.columns)} 個欄位。自動偵測到的構面分組："
-                + "；".join(f"{c}: {', '.join(items)}" for c, items in construct_dict.items())
-                + "。之後的對話請根據這份已上傳的資料回答，不用再問我有沒有上傳資料。"
-            ),
-        }]
+        chat_seed = (
+            f"（系統提示，非使用者本人輸入）我剛剛上傳了問卷資料「{file.filename}」，"
+            f"{len(df)} 筆、{len(df.columns)} 個欄位。自動偵測到的構面分組："
+            + "；".join(f"{c}: {', '.join(items)}" for c, items in construct_dict.items())
+        )
+        if structural_model:
+            chat_seed += (
+                "。這份檔案裡也附了結構路徑宣告（structural_model 工作表）："
+                + "；".join(f"{dep} ← {', '.join(indeps)}" for dep, indeps in structural_model.items())
+            )
+        if auto_declaration:
+            chat_seed += f"。系統已經自動建立宣告 #{auto_declaration['id']}（時間戳記：{auto_declaration['created_at']}），作為驗證性分析的基準點。"
+        chat_seed += "。之後的對話請根據這份已上傳的資料回答，不用再問我有沒有上傳資料。"
+        _get_user_session(request)["chat_history"] = [{"role": "user", "content": chat_seed}]
         save_session(df, construct_dict, request=request)
         audit_db.log_action(
             user_id, "upload",
             dataset_id=dataset_record["id"], declaration_id=declaration_id,
             request_params={"filename": file.filename},
-            result_summary={"rows": len(df), "columns": len(df.columns), "constructs": list(construct_dict.keys()), "file_hash": dataset_record["file_hash"]},
+            result_summary={
+                "rows": len(df), "columns": len(df.columns), "constructs": list(construct_dict.keys()),
+                "structural_model": structural_model, "file_hash": dataset_record["file_hash"],
+                "auto_declaration_id": auto_declaration["id"] if auto_declaration else None,
+            },
             is_exploratory=False,
         )
         return {
@@ -410,9 +442,16 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "rows": len(df),
             "columns": len(df.columns),
             "constructs": {k: v for k, v in construct_dict.items()},
+            "declaration_id": declaration_id,
+            "auto_declared": auto_declaration is not None,
+            "structural_model": structural_model,
             "all_columns": df.columns.tolist(),
             "dataset_id": dataset_record["id"],
-            "message": f"成功載入 {len(df)} 份問卷，偵測到 {len(construct_dict)} 個構面。",
+            "message": (
+                f"成功載入 {len(df)} 份問卷，偵測到 {len(construct_dict)} 個構面"
+                + (f"，並讀到 {len(structural_model)} 條結構路徑宣告" if structural_model else "")
+                + (f"，已自動建立宣告 #{auto_declaration['id']}（作為驗證性分析基準點）。" if auto_declaration else "。")
+            ),
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"檔案解析失敗：{e}")
@@ -1724,6 +1763,40 @@ async def chat_reset(request: Request):
     session = _get_user_session(request)
     session["chat_history"] = []
     return {"success": True}
+
+
+# ─── Model diagram ─────────────────────────────────────────────────
+# Draws whatever construct_dict/structural_model is currently declared --
+# not tied to any analysis having run. Available right after /upload
+# (construct_dict alone) and updates as soon as a structural model is
+# typed/declared. Not logged to audit_log: pure visualization, not an
+# analysis or optimization decision.
+
+def _resolve_diagram_inputs(request: Request, body: "DiagramInput"):
+    session = _get_user_session(request)
+    construct_dict = body.construct_dict or session.get("construct_dict") or {}
+    structural_model = body.structural_model if body.structural_model is not None else session.get("chat_structural_model")
+    if not construct_dict:
+        raise HTTPException(status_code=400, detail="沒有構面資料可以畫圖，請先上傳資料或提供 construct_dict")
+    return construct_dict, structural_model
+
+
+@app.post("/diagram")
+async def diagram(request: Request, body: DiagramInput):
+    construct_dict, structural_model = _resolve_diagram_inputs(request, body)
+    dot = build_model_diagram_dot(construct_dict, structural_model)
+    return {"dot": dot, "constructs": len(construct_dict), "has_structural": bool(structural_model)}
+
+
+@app.post("/diagram/image")
+async def diagram_image(request: Request, body: DiagramInput):
+    construct_dict, structural_model = _resolve_diagram_inputs(request, body)
+    dot = build_model_diagram_dot(construct_dict, structural_model)
+    try:
+        png_bytes = render_diagram_png(dot)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"圖表渲染失敗：{e}")
+    return Response(content=png_bytes, media_type="image/png")
 
 
 @app.get("/session/info")

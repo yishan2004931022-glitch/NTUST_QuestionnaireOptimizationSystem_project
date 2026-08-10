@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2-dev \
     libv8-dev \
     pandoc \
+    graphviz \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

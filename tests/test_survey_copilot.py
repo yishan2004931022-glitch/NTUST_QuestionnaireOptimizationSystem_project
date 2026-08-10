@@ -15,6 +15,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from app.stats_engine import (
+    load_data,
     calc_cronbach,
     calc_loadings_ave_cr,
     calc_cross_loadings,
@@ -27,6 +28,8 @@ from app.stats_engine import (
     detect_careless_responses,
     calc_deleted_alpha,
     calc_composite_score,
+    build_model_diagram_dot,
+    render_diagram_png,
 )
 
 from fastapi.testclient import TestClient
@@ -1329,3 +1332,226 @@ class TestChatEndpoint:
         r = client.post("/chat", json={"message": "hi", "provider": "openai", "api_key": "fake"})
         assert r.status_code == 500
         assert client.get("/chat/history").json()["history"] == before
+
+
+# ─────────────────────────────────────────────
+# Model diagram (construct/structural path visualization)
+# ─────────────────────────────────────────────
+
+class TestModelDiagramGeneration:
+    def test_includes_construct_and_item_nodes(self, construct_dict):
+        dot = build_model_diagram_dot(construct_dict)
+        for construct, items in construct_dict.items():
+            assert construct in dot
+            for item in items:
+                assert item in dot
+
+    def test_excludes_single_item_pseudo_constructs(self, construct_dict):
+        mixed = {**construct_dict, "Gender": ["Gender"]}
+        dot = build_model_diagram_dot(mixed)
+        # "Gender" the construct node shouldn't appear, but be careful: it
+        # could still appear as an *item* label under a real construct in
+        # principle, so check for the node declaration pattern instead.
+        assert 'label=Gender' not in dot.replace('"', '')
+
+    def test_no_structural_edges_without_structural_model(self, construct_dict):
+        dot = build_model_diagram_dot(construct_dict)
+        assert "#1a56db" not in dot  # the color used only for structural edges
+
+    def test_structural_edges_present_when_declared(self, construct_dict, structural_model):
+        dot = build_model_diagram_dot(construct_dict, structural_model)
+        assert "#1a56db" in dot
+        for dep, indeps in structural_model.items():
+            for indep in indeps:
+                assert f"{indep} -> {dep}" in dot.replace('"', '')
+
+    def test_structural_edge_ignores_unknown_construct(self, construct_dict):
+        dot = build_model_diagram_dot(construct_dict, {"PE": ["TR", "NOT_A_REAL_CONSTRUCT"]})
+        assert "NOT_A_REAL_CONSTRUCT" not in dot
+
+    def test_render_png_produces_real_png_bytes(self, construct_dict, structural_model):
+        dot = build_model_diagram_dot(construct_dict, structural_model)
+        png = render_diagram_png(dot)
+        assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+class TestDiagramEndpoint:
+    def test_requires_construct_data(self):
+        client = _make_client()
+        r = client.post("/diagram", json={})
+        assert r.status_code == 400
+
+    def test_uses_session_construct_dict_after_upload(self, synthetic_df):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/diagram", json={})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["has_structural"] is False
+        assert "TR" in body["dot"]
+
+    def test_explicit_body_overrides_session(self, synthetic_df, construct_dict, structural_model):
+        # structural_model fixture is {"PE": ["TR"], "EE": ["TR", "PE"]}
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/diagram", json={"construct_dict": construct_dict, "structural_model": structural_model})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["has_structural"] is True
+        dot = body["dot"].replace('"', '')
+        assert "TR -> PE" in dot
+        assert "TR -> EE" in dot
+        assert "PE -> EE" in dot
+
+    def test_image_endpoint_returns_png(self, synthetic_df, construct_dict):
+        client = _make_client()
+        _upload_synthetic(client, synthetic_df)
+        r = client.post("/diagram/image", json={"construct_dict": construct_dict})
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "image/png"
+        assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+# ─────────────────────────────────────────────
+# Structural model read from an .xlsx "structural_model" sheet
+#
+# Structural paths are a researcher's theoretical hypothesis, not
+# something derivable from response data -- this is the one exception,
+# and it only works because the researcher explicitly wrote a second
+# sheet into the same workbook, not because anything was inferred from
+# respondents' answers.
+# ─────────────────────────────────────────────
+
+class TestStructuralModelSheet:
+    def _build_xlsx(self, data_df, structural_rows=None, sheet_name="structural_model"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+            with pd.ExcelWriter(tmp.name, engine="openpyxl") as writer:
+                data_df.to_excel(writer, index=False, sheet_name="Sheet1")
+                if structural_rows is not None:
+                    pd.DataFrame(structural_rows).to_excel(writer, index=False, sheet_name=sheet_name)
+            return tmp.name
+
+    def test_csv_has_no_structural_model(self, synthetic_df):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+            synthetic_df.to_csv(tmp.name, index=False)
+            _, _, structural_model = load_data(tmp.name)
+        assert structural_model is None
+
+    def test_xlsx_without_second_sheet_has_no_structural_model(self, synthetic_df):
+        path = self._build_xlsx(synthetic_df, structural_rows=None)
+        _, _, structural_model = load_data(path)
+        assert structural_model is None
+
+    def test_parses_structural_model_sheet_and_merges_repeated_dependents(self, synthetic_df):
+        rows = [
+            {"dependent": "PE", "independent": "TR"},
+            {"dependent": "EE", "independent": "TR"},
+            {"dependent": "EE", "independent": "PE"},
+        ]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        _, _, structural_model = load_data(path)
+        assert structural_model == {"PE": ["TR"], "EE": ["TR", "PE"]}
+
+    def test_sheet_name_and_column_names_are_case_insensitive(self, synthetic_df):
+        rows = [{"Dependent": "PE", "Independent": "TR"}]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows, sheet_name="Structural_Model")
+        _, _, structural_model = load_data(path)
+        assert structural_model == {"PE": ["TR"]}
+
+    def test_ignores_blank_rows_in_structural_sheet(self, synthetic_df):
+        rows = [
+            {"dependent": "PE", "independent": "TR"},
+            {"dependent": None, "independent": None},
+        ]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        _, _, structural_model = load_data(path)
+        assert structural_model == {"PE": ["TR"]}
+
+    def test_missing_expected_columns_returns_none_not_error(self, synthetic_df):
+        rows = [{"from": "TR", "to": "PE"}]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        _, _, structural_model = load_data(path)
+        assert structural_model is None
+
+    def test_upload_endpoint_returns_and_seeds_structural_model(self, synthetic_df):
+        rows = [
+            {"dependent": "PE", "independent": "TR"},
+            {"dependent": "EE", "independent": "TR"},
+            {"dependent": "EE", "independent": "PE"},
+        ]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        client = _make_client()
+        with open(path, "rb") as f:
+            r = client.post(
+                "/upload",
+                files={"file": ("survey.xlsx", f.read(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["structural_model"] == {"PE": ["TR"], "EE": ["TR", "PE"]}
+        assert "結構路徑" in body["message"]
+
+        # /diagram with no explicit structural_model in the body must fall
+        # back to what /upload already stored in the session.
+        diagram = client.post("/diagram", json={})
+        assert diagram.status_code == 200
+        assert diagram.json()["has_structural"] is True
+
+        hist = client.get("/chat/history").json()["history"]
+        assert "結構路徑宣告" in hist[0]["content"]
+
+    def test_upload_with_structural_sheet_auto_declares(self, synthetic_df):
+        # A complete theory (constructs + structural paths) arriving in one
+        # upload with nothing declared yet this session IS the confirmatory
+        # baseline -- no need to make the researcher retype what they
+        # already wrote into the file.
+        rows = [{"dependent": "PE", "independent": "TR"}]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        client = _make_client()
+        with open(path, "rb") as f:
+            r = client.post(
+                "/upload",
+                files={"file": ("survey.xlsx", f.read(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            )
+        body = r.json()
+        assert body["auto_declared"] is True
+        assert body["declaration_id"] is not None
+        assert "自動建立宣告" in body["message"]
+
+        declaration = client.get(f"/declare/{body['declaration_id']}").json()
+        assert declaration["structural_model"] == {"PE": ["TR"]}
+
+        # It must also be a real, audited declaration -- not just a
+        # cosmetic response field -- so a later dataset/audit entry can
+        # trace back to it the same way a manual declaration would.
+        history = client.get("/audit/history").json()["entries"]
+        upload_entry = next(e for e in history if e["action"] == "upload")
+        assert upload_entry["declaration_id"] == body["declaration_id"]
+
+    def test_upload_does_not_overwrite_existing_manual_declaration(self, synthetic_df):
+        rows = [{"dependent": "PE", "independent": "TR"}]
+        path = self._build_xlsx(synthetic_df, structural_rows=rows)
+        client = _make_client()
+
+        manual = client.post("/declare", json={
+            "measurement_model": {"TR": ["TR1", "TR2"]},
+            "structural_model": {"EE": ["TR"]},
+        })
+        manual_id = manual.json()["id"]
+
+        with open(path, "rb") as f:
+            r = client.post(
+                "/upload",
+                files={"file": ("survey.xlsx", f.read(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            )
+        body = r.json()
+        assert body["auto_declared"] is False
+        assert body["declaration_id"] == manual_id
+
+    def test_csv_upload_without_structural_sheet_does_not_auto_declare(self, synthetic_df):
+        client = _make_client()
+        r = _upload_synthetic(client, synthetic_df)
+        body = r.json()
+        assert body["structural_model"] is None
+        assert body["auto_declared"] is False
+        assert body["declaration_id"] is None
