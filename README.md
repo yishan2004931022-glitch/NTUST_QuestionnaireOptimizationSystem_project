@@ -191,3 +191,15 @@ Use this checklist before exposing the API beyond a trusted admin network.
 - [ ] Persistence: mount `/app/data` to external storage in `docker-compose.yml`.
 - [ ] Secrets: use Docker secrets, an external `.env`, or a vault for API/LLM keys.
 - [ ] Observability: add request logging, structured JSON logs, and metrics.
+
+## 後續優化討論（L6）
+
+在完成既有統計分析與第一次 L4 優化後，可建立一個固定的討論快照，讓使用者以自然語言討論後續方案。LLM 僅解釋已保存的數值或呼叫既有優化器；不會修改統計計算、原始資料或正式問卷。
+
+Streamlit 使用者可直接在「優化模擬器」頁面的「與 AI 繼續優化（L6）」區塊操作。後端 API 為：
+
+- `POST /optimization-sessions`：保存基準與第一次建議。
+- `POST /optimization-sessions/{id}/messages`：以固定快照和 LLM 對話。
+- `POST /optimization-sessions/{id}/scenarios`、`POST /optimization-scenarios/{id}/simulate`：建立並模擬候選方案。
+
+完整資料流與文件分工見 [ARCHITECTURE.md](ARCHITECTURE.md)。

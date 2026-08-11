@@ -66,6 +66,41 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_dataset ON audit_log(dataset_id);
+
+-- L6: post-optimization discussion.  These records deliberately keep the
+-- statistical engine's output separate from the LLM's prose.  A scenario is
+-- only a reproducible request to the existing optimizer; it never mutates the
+-- uploaded data, the declared model, or a prior audit record.
+CREATE TABLE IF NOT EXISTS optimization_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    dataset_id INTEGER REFERENCES datasets(id),
+    declaration_id INTEGER REFERENCES declarations(id),
+    created_at TEXT NOT NULL,
+    snapshot TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS optimization_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    optimization_session_id INTEGER NOT NULL REFERENCES optimization_sessions(id),
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS optimization_scenarios (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    optimization_session_id INTEGER NOT NULL REFERENCES optimization_sessions(id),
+    created_at TEXT NOT NULL,
+    label TEXT NOT NULL,
+    constraints TEXT NOT NULL,
+    result TEXT,
+    status TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_optimization_session_user ON optimization_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_optimization_message_session ON optimization_messages(optimization_session_id);
+CREATE INDEX IF NOT EXISTS idx_optimization_scenario_session ON optimization_scenarios(optimization_session_id);
 """
 
 
@@ -217,3 +252,89 @@ def _audit_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "result_summary": json.loads(row["result_summary"]) if row["result_summary"] else None,
         "is_exploratory": bool(row["is_exploratory"]),
     }
+
+
+def create_optimization_session(
+    user_id: str,
+    dataset_id: Optional[int],
+    declaration_id: Optional[int],
+    snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    created_at = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO optimization_sessions (user_id, dataset_id, declaration_id, created_at, snapshot) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, dataset_id, declaration_id, created_at, json.dumps(snapshot, ensure_ascii=False, default=str)),
+        )
+    return {"id": cur.lastrowid, "user_id": user_id, "dataset_id": dataset_id,
+            "declaration_id": declaration_id, "created_at": created_at, "snapshot": snapshot}
+
+
+def get_optimization_session(session_id: int) -> Optional[Dict[str, Any]]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM optimization_sessions WHERE id = ?", (session_id,)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "user_id": row["user_id"], "dataset_id": row["dataset_id"],
+            "declaration_id": row["declaration_id"], "created_at": row["created_at"],
+            "snapshot": json.loads(row["snapshot"])}
+
+
+def add_optimization_message(session_id: int, role: str, content: str) -> Dict[str, Any]:
+    created_at = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO optimization_messages (optimization_session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (session_id, role, content, created_at),
+        )
+    return {"id": cur.lastrowid, "role": role, "content": content, "created_at": created_at}
+
+
+def list_optimization_messages(session_id: int) -> List[Dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM optimization_messages WHERE optimization_session_id = ? ORDER BY id", (session_id,)
+        ).fetchall()
+    return [{"id": r["id"], "role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
+
+
+def create_optimization_scenario(session_id: int, label: str, constraints: Dict[str, Any]) -> Dict[str, Any]:
+    created_at = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO optimization_scenarios (optimization_session_id, created_at, label, constraints, status) "
+            "VALUES (?, ?, ?, ?, 'draft')",
+            (session_id, created_at, label, json.dumps(constraints, ensure_ascii=False, default=str)),
+        )
+    return {"id": cur.lastrowid, "optimization_session_id": session_id, "created_at": created_at,
+            "label": label, "constraints": constraints, "result": None, "status": "draft"}
+
+
+def save_optimization_scenario_result(scenario_id: int, result: Dict[str, Any], status: str = "simulated") -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE optimization_scenarios SET result = ?, status = ? WHERE id = ?",
+            (json.dumps(result, ensure_ascii=False, default=str), status, scenario_id),
+        )
+
+
+def get_optimization_scenario(scenario_id: int) -> Optional[Dict[str, Any]]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM optimization_scenarios WHERE id = ?", (scenario_id,)).fetchone()
+    return _optimization_scenario_row(row) if row is not None else None
+
+
+def list_optimization_scenarios(session_id: int) -> List[Dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM optimization_scenarios WHERE optimization_session_id = ? ORDER BY id", (session_id,)
+        ).fetchall()
+    return [_optimization_scenario_row(row) for row in rows]
+
+
+def _optimization_scenario_row(row: sqlite3.Row) -> Dict[str, Any]:
+    return {"id": row["id"], "optimization_session_id": row["optimization_session_id"],
+            "created_at": row["created_at"], "label": row["label"],
+            "constraints": json.loads(row["constraints"]),
+            "result": json.loads(row["result"]) if row["result"] else None, "status": row["status"]}
