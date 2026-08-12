@@ -20,6 +20,10 @@ from pydantic import BaseModel
 from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+from typing import Optional
+
 from app.stats_engine import (
     load_data,
     calc_cronbach,
@@ -1898,3 +1902,67 @@ if frontend_dir:
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "Survey Co-Pilot API v1.0"}
+
+
+# 1. 定義前端傳進來的資料格式
+class ChatRequest(BaseModel):
+    user_message: str                 # 使用者在聊天室打的字
+    action: Optional[str] = "chat"    # 動作類型
+    provider: Optional[str] = None    # 可選: openai / anthropic
+    model: Optional[str] = None       # 可選: 指定模型
+
+# 2. 新增對話用的 Endpoint
+@app.post("/chat")
+async def chat_with_assistant(
+    req: ChatRequest,
+    x_api_key: Optional[str] = Header(None)  # 讀取 API Key 驗證
+):
+    """
+    對話式助手 API：接收使用者的提問，結合當前 Session 的數據給出回應
+    """
+    user_msg = req.user_message.strip()
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="提問內容不能為空")
+
+    # (A) 取得目前記憶體內/Session 裡的問卷數據與診斷結果
+    # 提示：可直接呼叫現有的內部邏輯，例如：
+    # current_data = get_current_session_data() 
+    # measurement_result = run_measurement_analysis_internal()
+
+    # (B) 組成給大語言模型 (LLM) 的 Prompt 提示詞
+    system_prompt = (
+        "你是一位專業的 PLS-SEM 結構方程模型與問卷診斷專家助手。"
+        "請用親切、清晰且白話的方式回答使用者的問題。"
+        "若使用者詢問問卷診斷，請結合統計數據給予具體改善建議。"
+    )
+    
+    # 結合上下文或數據 (範例)
+    full_prompt = f"{system_prompt}\n\n使用者提問：{user_msg}"
+
+    # (C) 呼叫專案原本寫好的 LLM 工具函數 (例如 llm_service / call_llm_provider)
+    try:
+        # 這裡直接呼叫專案現有的 LLM 模組
+        # (會自動讀取 .env 中的 LLM_API_KEY / LLM_PROVIDER)
+        ai_reply = await call_llm_service(
+            prompt=full_prompt,
+            provider=req.provider,
+            model=req.model
+        )
+        return {"status": "success", "reply": ai_reply}
+        
+    except Exception as e:
+        # 如果 LLM 呼叫失敗，返回 fallback 防呆訊息
+        return {
+            "status": "warning", 
+            "reply": f"助手目前無法連線至外部 LLM (原因: {str(e)})。建議您可以先點擊頁面上的按鈕查看基礎診斷報告！"
+        }
+    
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 或指定 "http://localhost:8501"
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
