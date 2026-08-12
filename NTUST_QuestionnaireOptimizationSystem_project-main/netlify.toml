@@ -1,0 +1,5 @@
+[build]
+  dockerfile = "Dockerfile"
+
+[dev]
+  command = "bash run.sh 8000"

@@ -1,0 +1,75 @@
+name: survey-copilot
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: survey-copilot-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./:/app:cached
+      - ./admin-web:/app/admin-web:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - SESSION_DIR=/app/data/latest_session
+      - SESSION_USER_ISOLATION=${SESSION_USER_ISOLATION:-false}
+      - SESSION_USER_ROOT=${SESSION_USER_ROOT:-/app/data/users}
+      - SESSION_TOKEN_TTL=${SESSION_TOKEN_TTL:-86400}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - FRONTEND_DIR=/app/admin-web
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Phase 5b: single conversational interface (upload/declare/diagnose/
+  # optimize all in one chat thread, driven by /chat tool calling).
+  frontend-chat:
+    build:
+      context: .
+      dockerfile: Dockerfile.gradio
+    container_name: survey-copilot-frontend-chat
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${FRONTEND_CHAT_PORT:-7860}:7860"
+    volumes:
+      - ./webapp:/app/webapp:cached
+    environment:
+      - BACKEND_URL=http://api:8000
+      - API_KEY=${API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+    env_file:
+      - .env
+
+  # Phase 5a: original multi-page wizard (L0-L5 as separate pages), kept
+  # alongside the chat interface for step-by-step manual control / demos.
+  frontend-streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: survey-copilot-frontend-streamlit
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${FRONTEND_STREAMLIT_PORT:-8501}:8501"
+    volumes:
+      - ./streamlit_app:/app/streamlit_app:cached
+    environment:
+      - BACKEND_URL=http://api:8000
+      - API_KEY=${API_KEY:-}
+    env_file:
+      - .env

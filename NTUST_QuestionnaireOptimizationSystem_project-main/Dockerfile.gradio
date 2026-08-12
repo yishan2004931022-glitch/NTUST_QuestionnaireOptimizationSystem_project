@@ -1,0 +1,14 @@
+# Dockerfile for Survey Co-Pilot conversational frontend (Phase 5b)
+FROM python:3.10-slim
+
+WORKDIR /app/webapp
+
+COPY webapp/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY webapp/ .
+
+ENV PYTHONUNBUFFERED=1
+EXPOSE 7860
+
+CMD ["python", "app.py"]
