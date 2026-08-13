@@ -1,0 +1,22 @@
+{
+  "rows": 185,
+  "constructs": [
+    "TRU",
+    "PE",
+    "EE",
+    "SI",
+    "FC",
+    "TE",
+    "OE",
+    "EC",
+    "ATT",
+    "BI",
+    "Gender",
+    "Age",
+    "Edu",
+    "Emp_Size",
+    "IT_Bg",
+    "Job_Level",
+    "Tenure"
+  ]
+}
