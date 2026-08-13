@@ -1,0 +1,75 @@
+{
+  "TRU": [
+    "TRU1",
+    "TRU2",
+    "TRU3"
+  ],
+  "PE": [
+    "PE1",
+    "PE2",
+    "PE3"
+  ],
+  "EE": [
+    "EE1",
+    "EE2",
+    "EE3"
+  ],
+  "SI": [
+    "SI1",
+    "SI2",
+    "SI3"
+  ],
+  "FC": [
+    "FC1",
+    "FC2",
+    "FC3"
+  ],
+  "TE": [
+    "TE1",
+    "TE2",
+    "TE3"
+  ],
+  "OE": [
+    "OE1",
+    "OE2",
+    "OE3"
+  ],
+  "EC": [
+    "EC1",
+    "EC2",
+    "EC3",
+    "EC4",
+    "EC5"
+  ],
+  "ATT": [
+    "ATT1",
+    "ATT2",
+    "ATT3"
+  ],
+  "BI": [
+    "BI1",
+    "BI2",
+    "BI3"
+  ],
+  "Gender": [
+    "Gender"
+  ],
+  "Age": [
+    "Age"
+  ],
+  "Edu": [
+    "Edu"
+  ],
+  "Emp_Size": [
+    "Emp_Size"
+  ],
+  "IT_Bg": [
+    "IT_Bg"
+  ],
+  "Job_Level": [
+    "Job_Level"
+  ],
+  "Tenure": [
+    "Tenure"
+  ]
+}
