@@ -7,6 +7,7 @@ Session identification (preferred order):
 2. x-session-id -> explicit session namespace
 3. No provider -> single default session (default)
 """
+import copy
 import hashlib
 import json
 import logging
@@ -364,6 +365,21 @@ class ChatInput(BaseModel):
     max_tokens: Optional[int] = 1500
 
 
+class OptimizationDiscussionInput(ChatInput):
+    """A chat turn that is explicitly grounded in one immutable analysis snapshot."""
+
+
+class OptimizationScenarioInput(BaseModel):
+    label: Optional[str] = "後續優化方案"
+    max_drop_ratio: Optional[float] = 0.10
+    boot_iterations: Optional[int] = 300
+    require_data_quality_flag: Optional[bool] = True
+
+
+class OptimizationDiscussionStartInput(BaseModel):
+    structural_model: Optional[Dict[str, List[str]]] = None
+
+
 class DiagramInput(BaseModel):
     construct_dict: Optional[Dict[str, List[str]]] = None
     structural_model: Optional[Dict[str, List[str]]] = None
@@ -428,7 +444,14 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         if auto_declaration:
             chat_seed += f"。系統已經自動建立宣告 #{auto_declaration['id']}（時間戳記：{auto_declaration['created_at']}），作為驗證性分析的基準點。"
         chat_seed += "。之後的對話請根據這份已上傳的資料回答，不用再問我有沒有上傳資料。"
-        _get_user_session(request)["chat_history"] = [{"role": "user", "content": chat_seed}]
+        upload_session = _get_user_session(request)
+        upload_session["chat_history"] = [{"role": "user", "content": chat_seed}]
+        # /chat/staged keeps its own separate history (see STAGED_CHAT_* /
+        # /chat/staged above) -- without seeding it the same way, its very
+        # first real message has zero grounding (the model doesn't know
+        # data was already uploaded/declared) even though /chat's history
+        # does, which is exactly the gap that showed up in testing.
+        upload_session["staged_chat_history"] = [{"role": "user", "content": chat_seed}]
         save_session(df, construct_dict, request=request)
         audit_db.log_action(
             user_id, "upload",
@@ -1023,6 +1046,13 @@ async def optimize_full_search(request: Request, body: OptimizeFullSearchInput):
             min_signals=body.min_signals or 2,
         )
         session["optimized_construct_dict"] = result["stage_a"]["optimized_construct_dict"]
+        # L6 must start from the exact L4 result the user has just reviewed,
+        # not silently re-run a different default configuration later.
+        session["chat_structural_model"] = body.structural_model
+        session["last_pipeline_result"] = {
+            **(session.get("last_pipeline_result") or {}),
+            "optimize_full_search": result,
+        }
         save_session(session.get("df"), session.get("construct_dict", {}), result["stage_a"]["optimized_construct_dict"], request=request)
         entry_id = audit_db.log_action(
             _resolve_user_id(request), "optimize_full_search",
@@ -1397,6 +1427,63 @@ CHAT_TOOLS_ANTHROPIC = [
 ]
 
 
+# ─── /chat/staged: a separate, opt-in tool-calling profile ────────────
+# Used only by the experimental "客服式助手" Streamlit page, never by /chat.
+# The point of this page is to force the AI to do ONE diagnostic step per
+# turn (mirroring the old wizard's separate 資料品質/測量結構診斷 pages)
+# instead of run_full_pipeline's "compute L1+L2+L3 in one shot" -- so this
+# profile swaps run_full_pipeline out for two narrower tools and instructs
+# the model to stop after each one. CHAT_SYSTEM_PROMPT / CHAT_TOOLS_* above
+# are untouched so /chat's existing behavior (used by 對話助手 and every
+# wizard page that calls it indirectly) is unaffected byte-for-byte.
+STAGED_CHAT_SYSTEM_PROMPT = (
+    "你是 Survey Co-Pilot，用「一步一步引導」的方式協助使用者診斷與優化問卷（PLS-SEM）。"
+    "跟一般模式不同：這裡把診斷拆成三個獨立步驟，你一次只能執行其中一個分析步驟，不能連續呼叫多個分析工具。"
+    "可以呼叫的工具：(1) set_declaration 設定構面/結構路徑宣告，"
+    "(2) analyze_data_quality 只執行 L1 資料品質檢測，"
+    "(3) analyze_measurement_structural 只執行 L2 測量模型信效度 + L3 結構路徑顯著性（L2 沒過會擋下 L3），"
+    "(4) rerun_optimization 執行 L4 結構路徑優化搜尋。\n"
+    "規則：\n"
+    "1. 每次回覆最多呼叫一個分析工具（analyze_data_quality / analyze_measurement_structural / rerun_optimization 三選一），"
+    "絕對不要在同一次回覆裡連續呼叫兩個分析工具、也不要自己接著呼叫下一步——做完一步就停下來，"
+    "用白話文講解這一步的結果，然後明確問使用者要不要繼續下一步。set_declaration 不算分析工具，需要時可以搭配其他工具一起用。\n"
+    "2. 絕對不能自己編造統計數字，所有數字都必須來自工具回傳的結果，沒有工具結果就不要講具體數字。\n"
+    "3. 如果 L2 沒過導致 L3 被擋下，要照實告訴使用者，不能假裝有跑出結構路徑結果。\n"
+    "4. 如果使用者還沒上傳資料，先請他們上傳。如果還沒宣告構面/結構路徑，引導使用者說明或呼叫 set_declaration。\n"
+    "5. set_declaration 的 construct_dict 參數只能放「題項欄位名稱」（資料檔裡實際存在的欄位），不能放構面名稱；"
+    "structural_model 參數只能放「構面名稱」，不確定使用者說的是題項還是構面就直接問，不要用工具亂猜。\n"
+    "6. 工具呼叫失敗時，先讀懂錯誤訊息裡的原因再決定下一步；絕對不要用完全一樣的參數重複呼叫同一個工具，"
+    "卡住就直接跟使用者說卡在哪裡，不要一直重試。\n"
+    "7. 用繁體中文回覆。"
+)
+
+STAGED_CHAT_TOOLS_OPENAI = [
+    CHAT_TOOLS_OPENAI[0],  # set_declaration, reused as-is
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_data_quality",
+            "description": "只執行 L1 資料品質檢測（多訊號收斂偵測，找出建議複查的樣本），不執行測量模型或結構路徑分析。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_measurement_structural",
+            "description": "執行 L2 測量模型信效度診斷；若通過 L2 關卡，接著執行 L3 結構路徑顯著性分析。不執行 L1 資料品質檢測。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    CHAT_TOOLS_OPENAI[2],  # rerun_optimization, reused as-is
+]
+
+STAGED_CHAT_TOOLS_ANTHROPIC = [
+    {"name": t["function"]["name"], "description": t["function"]["description"], "input_schema": t["function"]["parameters"]}
+    for t in STAGED_CHAT_TOOLS_OPENAI
+]
+
+
 def _merge_dict_of_lists(existing: Optional[dict], new: Optional[dict]) -> dict:
     merged = dict(existing or {})
     for k, v in (new or {}).items():
@@ -1455,22 +1542,25 @@ def _tool_exec_set_declaration(session: Dict, request: Request, args: dict) -> d
     return {"success": True, **updated}
 
 
-def _tool_exec_run_full_pipeline(session: Dict, request: Request, args: dict) -> dict:
-    df = session.get("df")
-    if df is None:
-        return {"error": "使用者還沒有上傳資料檔案，請先請使用者上傳。"}
-
+def _compute_data_quality(session: Dict) -> dict:
+    """L1 only. Split out of the old run_full_pipeline body so it can be
+    called either as part of that combined tool (unchanged behavior) or on
+    its own by the /chat/staged analyze_data_quality tool."""
+    df = session["df"]
     construct_dict = session.get("construct_dict") or {}
-    if not construct_dict:
-        return {"error": "還沒有構面宣告，請先呼叫 set_declaration。"}
-    structural_model = session.get("chat_structural_model") or {}
-
-    latent_constructs = {k: v for k, v in construct_dict.items() if len(v) >= 2}
-
     try:
-        data_quality = detect_careless_responses(df, construct_dict)
+        return detect_careless_responses(df, construct_dict)
     except Exception as e:
-        data_quality = {"error": str(e)}
+        return {"error": str(e)}
+
+
+def _compute_measurement_structural(session: Dict) -> dict:
+    """L2 (+ L3 if L2 passes). Split out of the old run_full_pipeline body
+    for the same reason as _compute_data_quality above."""
+    df = session["df"]
+    construct_dict = session.get("construct_dict") or {}
+    structural_model = session.get("chat_structural_model") or {}
+    latent_constructs = {k: v for k, v in construct_dict.items() if len(v) >= 2}
 
     reliability, convergent, low_loading_flags = {}, {}, []
     for construct, items in latent_constructs.items():
@@ -1509,13 +1599,68 @@ def _tool_exec_run_full_pipeline(session: Dict, request: Request, args: dict) ->
         except Exception as e:
             structural = {"error": str(e)}
 
-    result = {"data_quality": data_quality, "measurement": measurement, "structural": structural}
+    return {"measurement": measurement, "structural": structural}
+
+
+def _tool_exec_run_full_pipeline(session: Dict, request: Request, args: dict) -> dict:
+    df = session.get("df")
+    if df is None:
+        return {"error": "使用者還沒有上傳資料檔案，請先請使用者上傳。"}
+
+    construct_dict = session.get("construct_dict") or {}
+    if not construct_dict:
+        return {"error": "還沒有構面宣告，請先呼叫 set_declaration。"}
+
+    result = {"data_quality": _compute_data_quality(session), **_compute_measurement_structural(session)}
     session["last_pipeline_result"] = result
 
     audit_db.log_action(
         _resolve_user_id(request), "chat_run_full_pipeline",
         dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
-        request_params={"construct_dict": construct_dict, "structural_model": structural_model},
+        request_params={"construct_dict": construct_dict, "structural_model": session.get("chat_structural_model") or {}},
+        result_summary=result,
+        is_exploratory=False,
+    )
+    return result
+
+
+def _tool_exec_analyze_data_quality(session: Dict, request: Request, args: dict) -> dict:
+    df = session.get("df")
+    if df is None:
+        return {"error": "使用者還沒有上傳資料檔案，請先請使用者上傳。"}
+    construct_dict = session.get("construct_dict") or {}
+    if not construct_dict:
+        return {"error": "還沒有構面宣告，請先呼叫 set_declaration。"}
+
+    data_quality = _compute_data_quality(session)
+    result = {"data_quality": data_quality}
+    session["last_pipeline_result"] = {**session.get("last_pipeline_result", {}), "data_quality": data_quality}
+
+    audit_db.log_action(
+        _resolve_user_id(request), "chat_analyze_data_quality",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"construct_dict": construct_dict},
+        result_summary=result,
+        is_exploratory=False,
+    )
+    return result
+
+
+def _tool_exec_analyze_measurement_structural(session: Dict, request: Request, args: dict) -> dict:
+    df = session.get("df")
+    if df is None:
+        return {"error": "使用者還沒有上傳資料檔案，請先請使用者上傳。"}
+    construct_dict = session.get("construct_dict") or {}
+    if not construct_dict:
+        return {"error": "還沒有構面宣告，請先呼叫 set_declaration。"}
+
+    result = _compute_measurement_structural(session)
+    session["last_pipeline_result"] = {**session.get("last_pipeline_result", {}), **result}
+
+    audit_db.log_action(
+        _resolve_user_id(request), "chat_analyze_measurement_structural",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"construct_dict": construct_dict, "structural_model": session.get("chat_structural_model") or {}},
         result_summary=result,
         is_exploratory=False,
     )
@@ -1566,32 +1711,41 @@ def _execute_chat_tool(name: str, args: dict, session: Dict, request: Request) -
         return _tool_exec_set_declaration(session, request, args or {})
     if name == "run_full_pipeline":
         return _tool_exec_run_full_pipeline(session, request, args or {})
+    if name == "analyze_data_quality":
+        return _tool_exec_analyze_data_quality(session, request, args or {})
+    if name == "analyze_measurement_structural":
+        return _tool_exec_analyze_measurement_structural(session, request, args or {})
     if name == "rerun_optimization":
         return _tool_exec_rerun_optimization(session, request, args or {})
     return {"error": f"未知工具：{name}"}
 
 
+def _strip_optimize_bulk_fields(result: dict) -> dict:
+    """
+    Mutate `result` in place, replacing the two detail arrays that grow with
+    dataset size -- data_quality.respondents (one entry per row) and each
+    stage_b path's drop_log (one entry per sample-drop attempt, up to
+    max_drop_ratio * N) -- with short summaries. On a 185-respondent dataset
+    these alone added ~9000+ tokens to a single request and tripped Groq's
+    per-minute request-size limit even on a small model. Callers (both the
+    /chat tool loop and the L6 discussion snapshot) only ever need the
+    aggregate counts / final p/t/beta, never the row-by-row detail -- that
+    full detail is still returned to the caller and fully logged/stored.
+    Caller must pass an object it's fine to mutate (e.g. a deep copy).
+    """
+    dq = result.get("data_quality")
+    if isinstance(dq, dict) and "respondents" in dq:
+        dq["respondents"] = f"<{len(dq['respondents'])} 筆逐一受訪者訊號明細已省略>"
+    for entry in result.get("stage_b") or []:
+        if isinstance(entry.get("drop_log"), list):
+            entry["drop_log"] = f"<{len(entry['drop_log'])} 步逐步刪除搜尋紀錄已省略，最終結果見 status/final_p/final_t/final_beta>"
+    return result
+
+
 def _trim_tool_result_for_llm(name: str, result: dict) -> dict:
-    """
-    The full tool result (e.g. run_full_pipeline's per-respondent L1 signal
-    breakdown -- one entry per row) is what the audit log and the frontend
-    keep, but re-serializing it verbatim as the tool's "content" for the
-    *next* LLM call in the same tool-calling loop bloats that one request:
-    on a 185-respondent dataset this alone added ~9000 tokens to a single
-    request and tripped Groq's per-minute request-size limit even on a
-    small model. The LLM only ever narrates the aggregate counts
-    (flagged_count/total_respondents), never the row-level detail, so trim
-    it before it goes back into the conversation -- the full result is
-    still returned to the caller and still fully logged to audit_log.
-    """
     if not isinstance(result, dict) or result.get("error"):
         return result
-
-    trimmed = dict(result)
-    dq = trimmed.get("data_quality")
-    if isinstance(dq, dict) and "respondents" in dq:
-        trimmed["data_quality"] = {k: v for k, v in dq.items() if k != "respondents"}
-    return trimmed
+    return _strip_optimize_bulk_fields(copy.deepcopy(result))
 
 
 MAX_CHAT_TOOL_ITERATIONS = 4
@@ -1614,6 +1768,9 @@ async def _call_llm_chat(
     provider: str, api_key: str, model: str, messages: List[Dict],
     temperature: float, max_tokens: int, base_url: Optional[str],
     session: Dict, request: Request,
+    system_prompt: str = CHAT_SYSTEM_PROMPT,
+    tools_openai: List[Dict] = CHAT_TOOLS_OPENAI,
+    tools_anthropic: List[Dict] = CHAT_TOOLS_ANTHROPIC,
 ):
     """
     messages: plain {"role": "user"/"assistant", "content": str} turns only.
@@ -1621,6 +1778,11 @@ async def _call_llm_chat(
     wire formats) stays local to this one call and is never persisted back
     into session chat history -- that keeps the stored history provider-
     agnostic even if the user switches provider between messages.
+
+    system_prompt/tools_* default to the standard /chat profile; /chat/staged
+    passes STAGED_CHAT_SYSTEM_PROMPT/STAGED_CHAT_TOOLS_* instead so it can
+    force one-step-at-a-time tool calls without touching /chat's behavior.
+
     Returns (reply_text, tool_results).
     """
     provider = str(provider or "").lower().strip()
@@ -1633,13 +1795,13 @@ async def _call_llm_chat(
         from openai import AsyncOpenAI as OpenAI
         client = OpenAI(api_key=api_key or "", base_url=base_url or None)
         req_model = model or "gpt-4o-mini"
-        convo = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}] + list(messages)
+        convo = [{"role": "system", "content": system_prompt}] + list(messages)
         seen_calls = set()
 
         for _ in range(MAX_CHAT_TOOL_ITERATIONS):
             completion = await client.chat.completions.create(
                 model=req_model, temperature=float(temperature), max_tokens=int(max_tokens),
-                tools=CHAT_TOOLS_OPENAI, messages=convo,
+                tools=tools_openai, messages=convo,
             )
             msg = completion.choices[0].message
             if not msg.tool_calls:
@@ -1679,7 +1841,7 @@ async def _call_llm_chat(
         for _ in range(MAX_CHAT_TOOL_ITERATIONS):
             msg = cli.messages.create(
                 model=req_model, temperature=float(temperature), max_tokens=int(max_tokens),
-                system=CHAT_SYSTEM_PROMPT, tools=CHAT_TOOLS_ANTHROPIC, messages=convo,
+                system=system_prompt, tools=tools_anthropic, messages=convo,
             )
             if msg.stop_reason != "tool_use":
                 text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
@@ -1760,6 +1922,255 @@ async def chat(request: Request, body: ChatInput):
 async def chat_history(request: Request):
     session = _get_user_session(request)
     return {"history": session.get("chat_history", [])}
+
+
+@app.post("/chat/staged")
+async def chat_staged(request: Request, body: ChatInput):
+    """
+    Same wire shape as /chat, but forces one-diagnostic-step-per-turn via
+    STAGED_CHAT_SYSTEM_PROMPT/STAGED_CHAT_TOOLS_* (see their definitions
+    near CHAT_TOOLS_ANTHROPIC) and keeps its own conversation history
+    (session["staged_chat_history"]) so it never mixes with -- or affects --
+    /chat's history or behavior. Only the experimental「客服式助手」page
+    calls this.
+    """
+    session = _get_user_session(request)
+    history = session.setdefault("staged_chat_history", [])
+
+    if not body.message or not body.message.strip():
+        raise HTTPException(status_code=400, detail="訊息不能是空的")
+
+    provider = (body.provider or os.environ.get("LLM_PROVIDER") or "").strip().lower()
+    api_key = body.api_key or os.environ.get("LLM_API_KEY", "")
+    model = body.model or os.environ.get("LLM_MODEL", "")
+    base_url = body.base_url or os.environ.get("LLM_BASE_URL", "")
+
+    if not api_key or provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="請提供有效的 LLM provider 與 api_key（或在後端環境變數設定 LLM_PROVIDER / LLM_API_KEY）")
+
+    history.append({"role": "user", "content": body.message})
+
+    try:
+        reply, tool_results = await _call_llm_chat(
+            provider=provider, api_key=api_key, model=model, messages=history,
+            temperature=float(body.temperature or 0.3), max_tokens=int(body.max_tokens or 1500),
+            base_url=base_url, session=session, request=request,
+            system_prompt=STAGED_CHAT_SYSTEM_PROMPT,
+            tools_openai=STAGED_CHAT_TOOLS_OPENAI, tools_anthropic=STAGED_CHAT_TOOLS_ANTHROPIC,
+        )
+    except HTTPException:
+        history.pop()
+        raise
+    except Exception as e:
+        history.pop()
+        raise HTTPException(status_code=500, detail=f"LLM 呼叫失敗：{e}")
+
+    history.append({"role": "assistant", "content": reply})
+
+    audit_db.log_action(
+        _resolve_user_id(request), "chat_staged_message",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"message": body.message, "tool_calls": [t["name"] for t in tool_results]},
+        result_summary={"reply": reply, "tool_results": tool_results},
+        is_exploratory=any(t["name"] == "rerun_optimization" for t in tool_results),
+    )
+
+    return {
+        "reply": reply,
+        "tool_calls": tool_results,
+        "construct_dict": session.get("construct_dict"),
+        "structural_model": session.get("chat_structural_model"),
+    }
+
+
+@app.post("/chat/staged/reset")
+async def chat_staged_reset(request: Request):
+    session = _get_user_session(request)
+    session["staged_chat_history"] = []
+    return {"success": True}
+
+
+# ─── L6: post-optimization discussion ────────────────────────────
+# This layer deliberately does not alter L1-L4.  It stores an immutable
+# snapshot of their output and treats every later proposal as a separate,
+# reproducible call to the existing optimizer.
+
+def _optimization_snapshot(session: Dict, initial_result: Dict) -> Dict:
+    df = session["df"]
+    construct_dict = session.get("construct_dict") or {}
+    latent = {name: items for name, items in construct_dict.items() if len(items) >= 2}
+    reliability = {name: calc_cronbach(df, items) for name, items in latent.items()}
+    convergent = {name: calc_loadings_ave_cr(df, items) for name, items in latent.items()}
+    return {
+        "dataset_id": session.get("dataset_id"),
+        "declaration_id": session.get("declaration_id"),
+        "construct_dict": construct_dict,
+        "structural_model": session.get("chat_structural_model") or {},
+        "baseline_metrics": {"reliability": reliability, "convergent_validity": convergent},
+        "initial_recommendation": initial_result,
+        "integrity_note": "此快照只記錄既有統計/優化引擎的輸出；LLM 不會自行產生統計數值。",
+    }
+
+
+def _llm_snapshot_view(snapshot: Dict) -> Dict:
+    """Strip the per-respondent / per-drop-iteration detail arrays (see
+    _strip_optimize_bulk_fields) before sending the snapshot to the LLM as
+    prompt context. Nothing here changes what's stored in the DB or shown
+    in the UI -- this is a read-only view built fresh for each LLM call.
+    """
+    view = copy.deepcopy(snapshot)
+    if view.get("initial_recommendation"):
+        _strip_optimize_bulk_fields(view["initial_recommendation"])
+    return view
+
+
+def _get_owned_optimization_session(request: Request, optimization_session_id: int) -> Dict:
+    record = audit_db.get_optimization_session(optimization_session_id)
+    if record is None or record["user_id"] != _resolve_user_id(request):
+        raise HTTPException(status_code=404, detail="找不到優化討論工作階段")
+    return record
+
+
+def _scenario_constraints(body: OptimizationScenarioInput) -> Dict:
+    return {
+        "max_drop_ratio": min(max(float(body.max_drop_ratio or 0.10), 0.02), 0.30),
+        "boot_iterations": min(max(int(body.boot_iterations or 300), 50), 1000),
+        "require_data_quality_flag": _coerce_bool(body.require_data_quality_flag, True),
+    }
+
+
+def _run_discussion_scenario(session: Dict, constraints: Dict) -> Dict:
+    """Call the existing optimizer without changing its algorithm or inputs."""
+    df = session.get("df")
+    construct_dict = session.get("construct_dict") or {}
+    structural_model = session.get("chat_structural_model") or {}
+    if df is None or not construct_dict or not structural_model:
+        raise HTTPException(status_code=400, detail="請先上傳資料並完成構面與結構路徑宣告")
+    return optimize_unified(
+        df=df,
+        construct_dict=construct_dict,
+        structural_model=structural_model,
+        max_drop_ratio=constraints["max_drop_ratio"],
+        boot_iterations=constraints["boot_iterations"],
+        require_data_quality_flag=constraints["require_data_quality_flag"],
+    )
+
+
+@app.post("/optimization-sessions")
+async def create_optimization_discussion(request: Request, body: Optional[OptimizationDiscussionStartInput] = None):
+    """Freeze the baseline and first recommendation before LLM discussion starts."""
+    session = _get_user_session(request)
+    if session.get("df") is None:
+        raise HTTPException(status_code=400, detail="請先完成上傳與基礎統計分析")
+    if body and body.structural_model:
+        # The user may have declared the paths through the Streamlit upload
+        # flow rather than the chat tool.  Store that already-declared model
+        # as session context only; no statistical input or prior result is
+        # changed here.
+        session["chat_structural_model"] = body.structural_model
+
+    initial_result = (session.get("last_pipeline_result") or {}).get("optimize_full_search")
+    if initial_result is None:
+        # The first recommendation is computed by the pre-existing engine;
+        # this endpoint never changes any statistical threshold or algorithm.
+        initial_result = _run_discussion_scenario(session, _scenario_constraints(OptimizationScenarioInput()))
+
+    snapshot = _optimization_snapshot(session, initial_result)
+    record = audit_db.create_optimization_session(
+        _resolve_user_id(request), session.get("dataset_id"), session.get("declaration_id"), snapshot,
+    )
+    session["optimization_discussion_id"] = record["id"]
+    audit_db.log_action(
+        _resolve_user_id(request), "create_optimization_discussion",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"optimization_session_id": record["id"]}, result_summary={"snapshot": snapshot},
+        is_exploratory=True,
+    )
+    return record
+
+
+@app.get("/optimization-sessions/{optimization_session_id}")
+async def get_optimization_discussion(request: Request, optimization_session_id: int):
+    record = _get_owned_optimization_session(request, optimization_session_id)
+    return {
+        **record,
+        "messages": audit_db.list_optimization_messages(optimization_session_id),
+        "scenarios": audit_db.list_optimization_scenarios(optimization_session_id),
+    }
+
+
+@app.post("/optimization-sessions/{optimization_session_id}/scenarios")
+async def create_discussion_scenario(request: Request, optimization_session_id: int, body: OptimizationScenarioInput):
+    record = _get_owned_optimization_session(request, optimization_session_id)
+    session = _get_user_session(request)
+    if record.get("dataset_id") != session.get("dataset_id"):
+        raise HTTPException(status_code=409, detail="目前上傳資料與此討論快照不同，請重新建立討論工作階段")
+    scenario = audit_db.create_optimization_scenario(optimization_session_id, body.label or "後續優化方案", _scenario_constraints(body))
+    return scenario
+
+
+@app.post("/optimization-scenarios/{scenario_id}/simulate")
+async def simulate_discussion_scenario(request: Request, scenario_id: int):
+    scenario = audit_db.get_optimization_scenario(scenario_id)
+    if scenario is None:
+        raise HTTPException(status_code=404, detail="找不到候選方案")
+    _get_owned_optimization_session(request, scenario["optimization_session_id"])
+    session = _get_user_session(request)
+    result = _run_discussion_scenario(session, scenario["constraints"])
+    audit_db.save_optimization_scenario_result(scenario_id, result)
+    audit_db.log_action(
+        _resolve_user_id(request), "simulate_optimization_scenario",
+        dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
+        request_params={"scenario_id": scenario_id, "constraints": scenario["constraints"]},
+        result_summary=result, is_exploratory=True,
+    )
+    return audit_db.get_optimization_scenario(scenario_id)
+
+
+@app.post("/optimization-sessions/{optimization_session_id}/messages")
+async def optimization_discussion_message(request: Request, optimization_session_id: int, body: OptimizationDiscussionInput):
+    record = _get_owned_optimization_session(request, optimization_session_id)
+    session = _get_user_session(request)
+    if record.get("dataset_id") != session.get("dataset_id"):
+        raise HTTPException(status_code=409, detail="目前上傳資料與此討論快照不同，請重新建立討論工作階段")
+    if not body.message or not body.message.strip():
+        raise HTTPException(status_code=400, detail="訊息不能為空白")
+
+    provider = (body.provider or os.environ.get("LLM_PROVIDER") or "").strip().lower()
+    api_key = body.api_key or os.environ.get("LLM_API_KEY", "")
+    if not api_key or provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="請在伺服器設定有效的 LLM provider 與 API key")
+
+    previous = audit_db.list_optimization_messages(optimization_session_id)[-12:]
+    context = "以下是不可變的統計分析快照與第一次優化建議。只可引用其中或工具回傳的數值：\n" + json.dumps(_llm_snapshot_view(record["snapshot"]), ensure_ascii=False, default=str)
+    messages = [{"role": "user", "content": context}] + [
+        {"role": item["role"], "content": item["content"]} for item in previous
+    ] + [{"role": "user", "content": body.message}]
+    audit_db.add_optimization_message(optimization_session_id, "user", body.message)
+    try:
+        reply, tool_results = await _call_llm_chat(
+            provider=provider, api_key=api_key, model=body.model or os.environ.get("LLM_MODEL", ""),
+            messages=messages, temperature=float(body.temperature or 0.3), max_tokens=int(body.max_tokens or 1500),
+            base_url=body.base_url or os.environ.get("LLM_BASE_URL", ""), session=session, request=request,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM 呼叫失敗：{exc}")
+    audit_db.add_optimization_message(optimization_session_id, "assistant", reply)
+
+    # If the LLM asks the existing optimizer to re-run, retain its exact
+    # parameters/output as a scenario card for later comparison.
+    scenarios = []
+    for tool in tool_results:
+        if tool["name"] == "rerun_optimization" and not tool["result"].get("error"):
+            constraints = {
+                "max_drop_ratio": min(max(float(tool["args"].get("max_drop_ratio") or 0.10), 0.02), 0.30),
+                "boot_iterations": min(max(int(tool["args"].get("boot_iterations") or 300), 50), 1000),
+                "require_data_quality_flag": _coerce_bool(tool["args"].get("require_data_quality_flag"), True),
+            }
+            scenario = audit_db.create_optimization_scenario(optimization_session_id, "LLM 後續優化方案", constraints)
+            audit_db.save_optimization_scenario_result(scenario["id"], tool["result"])
+            scenarios.append(audit_db.get_optimization_scenario(scenario["id"]))
+    return {"reply": reply, "tool_calls": tool_results, "scenarios": scenarios}
 
 
 @app.post("/chat/reset")
