@@ -1215,9 +1215,11 @@ class TestChatEndpoint:
         # ~9000 tokens serialized -- large enough to trip a provider's
         # per-minute request-size limit on a single follow-up call within
         # one tool-calling turn. The LLM only ever narrates the aggregate
-        # counts, so this must be stripped before re-entering the LLM
+        # counts, so this must be summarized before re-entering the LLM
         # conversation, without touching what callers outside the LLM loop
-        # (audit log, API response) receive.
+        # (audit log, API response) receive. The key itself is kept (so
+        # code checking `"respondents" in dq` doesn't need to change) --
+        # only the bulky value is replaced with a short string summary.
         result = {
             "data_quality": {
                 "signals_used": ["mahalanobis"], "total_respondents": 3, "flagged_count": 0,
@@ -1226,10 +1228,29 @@ class TestChatEndpoint:
             "measurement": {"summary": {"latent_constructs": 1}},
         }
         trimmed = main_module._trim_tool_result_for_llm("run_full_pipeline", result)
-        assert "respondents" not in trimmed["data_quality"]
+        assert isinstance(trimmed["data_quality"]["respondents"], str)
+        assert "3" in trimmed["data_quality"]["respondents"]
         assert trimmed["data_quality"]["total_respondents"] == 3
         assert trimmed["measurement"] == result["measurement"]
-        assert "respondents" in result["data_quality"], "the original dict passed in must not be mutated"
+        assert isinstance(result["data_quality"]["respondents"], list), "the original dict passed in must not be mutated"
+
+    def test_trim_tool_result_for_llm_strips_stage_b_drop_log(self):
+        # Same class of problem as data_quality.respondents, but for Stage
+        # B: each non-significant path's drop_log has one entry per sample-
+        # drop attempt (up to max_drop_ratio * N), which also grows with
+        # dataset size and isn't something the LLM needs row-by-row.
+        result = {
+            "stage_b": [
+                {"path": "TR -> PE", "status": "success", "final_p": 0.03, "drop_log": [{"drop_count": i} for i in range(5)]},
+                {"path": "TR -> EE", "status": "already_significant"},
+            ],
+        }
+        trimmed = main_module._trim_tool_result_for_llm("rerun_optimization", result)
+        assert isinstance(trimmed["stage_b"][0]["drop_log"], str)
+        assert "5" in trimmed["stage_b"][0]["drop_log"]
+        assert trimmed["stage_b"][0]["final_p"] == 0.03
+        assert "drop_log" not in trimmed["stage_b"][1]
+        assert isinstance(result["stage_b"][0]["drop_log"], list), "the original dict passed in must not be mutated"
 
     def test_run_full_pipeline_via_chat(self, synthetic_df, construct_dict, structural_model, monkeypatch):
         client = _make_client()
