@@ -267,3 +267,11 @@ Phase 5b 上線後使用者拿真實資料（185 筆、10 個構面）馬上實�
 Streamlit 的「優化模擬器」頁面新增「與 AI 繼續優化」區塊。使用者需先建立不可變快照，接著可檢視基準／第一次建議、和 AI 對話、建立手動候選方案並模擬；任何方案都不會直接套用或覆寫問卷。
 
 文件整理：`README.md` 持續是安裝與 API 快速手冊，`PROFESSOR_REPORT.md` 保留研究報告，`DEVELOPMENT_LOG.md` 保存決策歷程；新增 `ARCHITECTURE.md` 作為系統分層、資料流、L6 邊界與 API 的唯一架構總覽。
+
+## 階段 21：退場 Gradio，收斂為單一 Streamlit 前端
+
+重新檢視兩套前端的實際程式碼後發現，當初「Gradio 是對話式的新方向、Streamlit 是逐步引導的舊方向」這個認知已經過時：`streamlit_app/pages/1_對話助手.py` 呼叫的其實是跟 Gradio 完全相同的 `/chat` 端點，且 Streamlit 這邊還多了 Gradio 沒有的東西——`8_客服式助手.py`（走 `/chat/staged` 的逐步引導對話）、階段 20 的 L6 後續優化討論、以及五個資料品質／診斷／模擬／稽核／情境比較頁面。Gradio（`webapp/app.py`，317 行）從階段 18 決定兩者並存之後就沒有再長功能，Streamlit（1478 行）持續在長，兩者已經不是對等的兩個選項，維護兩套 UI 對每個新功能都是雙倍工作量。
+
+決定退場 Gradio，只留 Streamlit：刪除 `webapp/`、`Dockerfile.gradio`，`docker-compose.yml` 拿掉 `frontend-chat` service，CI 拿掉 `docker-gradio` job。`PROFESSOR_REPORT.md` 的架構圖、部署環境、功能現況表同步更新，不再描述一個已經不存在的元件。
+
+同一輪順便在 CI 加了一個會真的打 LLM API 的 smoke test（`docker-api` job 的 "Boot smoke test" 之後），直接原因是 `.env` 的 `LLM_MODEL=llama-3.3-70b-versatile` 有一天悄悄失效——Groq 把整個 `llama-3.x` 系列下架了，改成 `openai/gpt-oss-*`、`qwen/*` 這些，而這件事完全沒有任何自動化機制發現，是手動測 `/chat` 才撞到 `model_not_found`。新 smoke test 送一句最短訊息到 `/chat`，斷言 `reply` 非空；模型名稱放在 repo variable `CI_LLM_MODEL` 而不是寫死在 workflow 裡，就是為了讓「provider 又下架了某個模型」這種事以後只要改一個 repo 設定，不用動程式碼。API key 存在 secret `CI_LLM_API_KEY`，沒設定時這個步驟會印訊息後乾淨跳過，不會拖垮沒有 secrets 存取權的 PR（例如外部貢獻者）。

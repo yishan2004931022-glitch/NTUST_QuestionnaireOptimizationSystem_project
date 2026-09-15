@@ -2,11 +2,10 @@
 """
 Phase A conversational front end: upload / declare / diagnose / re-run L4
 optimization all through one chat thread, driven by the backend's existing
-/chat tool-calling loop (the same loop the Gradio frontend on port 7860
-uses). The difference from Gradio is purely presentational -- tool results
-are rendered with the same Streamlit widgets (st.metric/st.expander/
-st.dataframe) the step-by-step wizard pages use, instead of being flattened
-into plain chat text. Nothing about L1-L4's calculations changes here.
+/chat tool-calling loop. Tool results are rendered with the same Streamlit
+widgets (st.metric/st.expander/st.dataframe) the step-by-step wizard pages
+use, instead of being flattened into plain chat text. Nothing about L1-L4's
+calculations changes here.
 
 L6 (post-optimization discussion) is intentionally NOT wired into this
 tool loop yet -- it stays on the「優化模擬器」page for now; see

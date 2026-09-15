@@ -43,7 +43,12 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Boot smoke test
         run: |
-          docker run -d --name api-smoke -p 8000:8000 survey-copilot-api:${{ github.sha }}
+          docker run -d --name api-smoke -p 8000:8000 \
+            -e LLM_PROVIDER=openai \
+            -e LLM_MODEL="${{ vars.CI_LLM_MODEL || 'openai/gpt-oss-120b' }}" \
+            -e LLM_API_KEY="${{ secrets.CI_LLM_API_KEY }}" \
+            -e LLM_BASE_URL=https://api.groq.com/openai/v1 \
+            survey-copilot-api:${{ github.sha }}
           ok=""
           for i in $(seq 1 30); do
             if curl -sf http://localhost:8000/health >/dev/null; then ok=1; break; fi
@@ -55,14 +60,42 @@ jobs:
             exit 1
           fi
           echo "API healthy"
+      # Catches provider-side breakage that a plain health check can't see --
+      # e.g. the LLM_MODEL value being deprecated/renamed upstream (this bit
+      # us once: llama-3.3-70b-versatile silently stopped existing on Groq
+      # and nothing caught it until someone tried the chat UI by hand).
+      # CI_LLM_MODEL is a repo *variable* (not secret) precisely so bumping
+      # the model after a provider catalog change doesn't need a code change.
+      # Skips cleanly when CI_LLM_API_KEY isn't set (e.g. fork PRs, which
+      # don't get repo secrets) rather than failing the whole job.
+      - name: LLM roundtrip smoke test
+        env:
+          HAS_LLM_KEY: ${{ secrets.CI_LLM_API_KEY != '' }}
+        run: |
+          if [ "$HAS_LLM_KEY" != "true" ]; then
+            echo "CI_LLM_API_KEY not set, skipping LLM roundtrip smoke test"
+            exit 0
+          fi
+          body='{"message": "Reply with a single short sentence confirming you are working."}'
+          resp=$(curl -sf -X POST http://localhost:8000/chat \
+            -H "Content-Type: application/json" \
+            -H "x-user-id: ci-llm-smoke" \
+            --data-binary "$body")
+          reply=$(echo "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("reply") or "")')
+          if [ -z "$reply" ]; then
+            echo "LLM roundtrip failed -- full response:"
+            echo "$resp"
+            exit 1
+          fi
+          echo "LLM roundtrip OK, reply: $reply"
       - name: Stop container
         if: always()
         run: docker stop api-smoke 2>/dev/null || true
 
-  # Build-only checks for the two frontend images -- these depend on the
-  # API being reachable to do anything meaningful at runtime, so a full
-  # boot+integration test isn't worth the CI complexity here; confirming
-  # they still build in a clean environment is the useful signal.
+  # Build-only check for the frontend image -- it depends on the API being
+  # reachable to do anything meaningful at runtime, so a full boot+integration
+  # test isn't worth the CI complexity here; confirming it still builds in a
+  # clean environment is the useful signal.
   docker-streamlit:
     runs-on: ubuntu-latest
     needs: test
@@ -74,21 +107,6 @@ jobs:
           context: .
           file: ./Dockerfile.streamlit
           tags: survey-copilot-streamlit:${{ github.sha }}
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  docker-gradio:
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.gradio
-          tags: survey-copilot-gradio:${{ github.sha }}
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
