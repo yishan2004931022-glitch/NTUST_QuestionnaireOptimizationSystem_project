@@ -1455,12 +1455,12 @@ class TestStructuralModelSheet:
     def test_csv_has_no_structural_model(self, synthetic_df):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
             synthetic_df.to_csv(tmp.name, index=False)
-            _, _, structural_model = load_data(tmp.name)
+            _, _, structural_model, _, _ = load_data(tmp.name)
         assert structural_model is None
 
     def test_xlsx_without_second_sheet_has_no_structural_model(self, synthetic_df):
         path = self._build_xlsx(synthetic_df, structural_rows=None)
-        _, _, structural_model = load_data(path)
+        _, _, structural_model, _, _ = load_data(path)
         assert structural_model is None
 
     def test_parses_structural_model_sheet_and_merges_repeated_dependents(self, synthetic_df):
@@ -1470,13 +1470,13 @@ class TestStructuralModelSheet:
             {"dependent": "EE", "independent": "PE"},
         ]
         path = self._build_xlsx(synthetic_df, structural_rows=rows)
-        _, _, structural_model = load_data(path)
+        _, _, structural_model, _, _ = load_data(path)
         assert structural_model == {"PE": ["TR"], "EE": ["TR", "PE"]}
 
     def test_sheet_name_and_column_names_are_case_insensitive(self, synthetic_df):
         rows = [{"Dependent": "PE", "Independent": "TR"}]
         path = self._build_xlsx(synthetic_df, structural_rows=rows, sheet_name="Structural_Model")
-        _, _, structural_model = load_data(path)
+        _, _, structural_model, _, _ = load_data(path)
         assert structural_model == {"PE": ["TR"]}
 
     def test_ignores_blank_rows_in_structural_sheet(self, synthetic_df):
@@ -1485,13 +1485,13 @@ class TestStructuralModelSheet:
             {"dependent": None, "independent": None},
         ]
         path = self._build_xlsx(synthetic_df, structural_rows=rows)
-        _, _, structural_model = load_data(path)
+        _, _, structural_model, _, _ = load_data(path)
         assert structural_model == {"PE": ["TR"]}
 
     def test_missing_expected_columns_returns_none_not_error(self, synthetic_df):
         rows = [{"from": "TR", "to": "PE"}]
         path = self._build_xlsx(synthetic_df, structural_rows=rows)
-        _, _, structural_model = load_data(path)
+        _, _, structural_model, _, _ = load_data(path)
         assert structural_model is None
 
     def test_upload_endpoint_returns_and_seeds_structural_model(self, synthetic_df):

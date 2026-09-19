@@ -66,8 +66,6 @@ API_KEY = os.environ.get("API_KEY", "")
 _tokens: Dict[str, Dict[str, Optional[str]]] = {}
 _TOKEN_FILE = "/app/data/tokens.json"
 DEFAULT_TOKEN_TTL = int(os.environ.get("SESSION_TOKEN_TTL", "86400"))
-SESSION_USER_ISOLATION = str(os.environ.get("SESSION_USER_ISOLATION", "false")).lower() == "true"
-SESSION_USER_ROOT = os.environ.get("SESSION_USER_ROOT", "/app/data/users")
 FRONTEND_DIR = os.environ.get("FRONTEND_DIR", "")
 
 
@@ -393,7 +391,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        df, construct_dict, structural_model = load_data(tmp_path)
+        df, construct_dict, structural_model, demographic_columns, rows_dropped_for_missing = load_data(tmp_path)
         user_id = _resolve_user_id(request)
         declaration_id = _get_user_session(request).get("declaration_id")
         auto_declaration = None
@@ -414,6 +412,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         session = {
             "df": df,
             "construct_dict": construct_dict,
+            "demographic_columns": demographic_columns,
             "filepath": tmp_path,
             "dataset_id": dataset_record["id"],
             "declaration_id": declaration_id,
@@ -429,7 +428,9 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         # means every chat call in this session starts with real context.
         chat_seed = (
             f"（系統提示，非使用者本人輸入）我剛剛上傳了問卷資料「{file.filename}」，"
-            f"{len(df)} 筆、{len(df.columns)} 個欄位。自動偵測到的構面分組："
+            f"{len(df)} 筆、{len(df.columns)} 個欄位"
+            + (f"（原始 {len(df) + rows_dropped_for_missing} 筆，因缺值移除 {rows_dropped_for_missing} 筆）" if rows_dropped_for_missing else "")
+            + "。自動偵測到的構面分組："
             + "；".join(f"{c}: {', '.join(items)}" for c, items in construct_dict.items())
         )
         if structural_model:
@@ -448,13 +449,14 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         # data was already uploaded/declared) even though /chat's history
         # does, which is exactly the gap that showed up in testing.
         upload_session["staged_chat_history"] = [{"role": "user", "content": chat_seed}]
-        save_session(df, construct_dict, request=request)
+        save_session(df, construct_dict, request=request, user_id=user_id)
         audit_db.log_action(
             user_id, "upload",
             dataset_id=dataset_record["id"], declaration_id=declaration_id,
             request_params={"filename": file.filename},
             result_summary={
                 "rows": len(df), "columns": len(df.columns), "constructs": list(construct_dict.keys()),
+                "demographic_columns": demographic_columns, "rows_dropped_for_missing": rows_dropped_for_missing,
                 "structural_model": structural_model, "file_hash": dataset_record["file_hash"],
                 "auto_declaration_id": auto_declaration["id"] if auto_declaration else None,
             },
@@ -465,13 +467,18 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "rows": len(df),
             "columns": len(df.columns),
             "constructs": {k: v for k, v in construct_dict.items()},
+            "demographic_columns": demographic_columns,
+            "rows_dropped_for_missing": rows_dropped_for_missing,
             "declaration_id": declaration_id,
             "auto_declared": auto_declaration is not None,
             "structural_model": structural_model,
             "all_columns": df.columns.tolist(),
             "dataset_id": dataset_record["id"],
             "message": (
-                f"成功載入 {len(df)} 份問卷，偵測到 {len(construct_dict)} 個構面"
+                f"成功載入 {len(df)} 份問卷"
+                + (f"（原始 {len(df) + rows_dropped_for_missing} 筆，因缺值移除 {rows_dropped_for_missing} 筆）" if rows_dropped_for_missing else "")
+                + f"，偵測到 {len(construct_dict)} 個構面"
+                + (f"、{len(demographic_columns)} 個人口統計/控制欄位" if demographic_columns else "")
                 + (f"，並讀到 {len(structural_model)} 條結構路徑宣告" if structural_model else "")
                 + (f"，已自動建立宣告 #{auto_declaration['id']}（作為驗證性分析基準點）。" if auto_declaration else "。")
             ),
@@ -484,7 +491,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 async def session_reset(request: Request):
     """Reset current caller's session."""
     _set_user_session(request, {})
-    clear_session(request=request)
+    clear_session(request=request, user_id=_resolve_user_id(request))
     return {"success": True, "message": "已重置 session"}
 
 
@@ -846,6 +853,7 @@ async def analyze_llm_suggestions(request: Request, body: LLMInput):
             optimized=session.get("optimized_construct_dict"),
             report={"llm_suggestions": llm_suggestions},
             request=request,
+            user_id=_resolve_user_id(request),
         )
     except Exception:
         pass
@@ -958,9 +966,9 @@ async def optimize_measurement_endpoint(request: Request, body: OptimizeMeasurem
     construct_dict = body.construct_dict or session.get("construct_dict", {})
 
     try:
-        result = optimize_measurement(df, construct_dict)
+        result = optimize_measurement(df, construct_dict, session.get("chat_structural_model"))
         session["optimized_construct_dict"] = result["optimized_construct_dict"]
-        save_session(session.get("df"), session.get("construct_dict", {}), result["optimized_construct_dict"], request=request)
+        save_session(session.get("df"), session.get("construct_dict", {}), result["optimized_construct_dict"], request=request, user_id=_resolve_user_id(request))
         audit_db.log_action(
             _resolve_user_id(request), "optimize_measurement",
             dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),
@@ -1049,7 +1057,7 @@ async def optimize_full_search(request: Request, body: OptimizeFullSearchInput):
             **(session.get("last_pipeline_result") or {}),
             "optimize_full_search": result,
         }
-        save_session(session.get("df"), session.get("construct_dict", {}), result["stage_a"]["optimized_construct_dict"], request=request)
+        save_session(session.get("df"), session.get("construct_dict", {}), result["stage_a"]["optimized_construct_dict"], request=request, user_id=_resolve_user_id(request))
         entry_id = audit_db.log_action(
             _resolve_user_id(request), "optimize_full_search",
             dataset_id=session.get("dataset_id"), declaration_id=session.get("declaration_id"),

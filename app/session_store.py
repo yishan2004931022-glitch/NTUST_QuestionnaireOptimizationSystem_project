@@ -47,6 +47,16 @@ def _slugify(value: str) -> str:
 
 
 def _current_user_id(request) -> Optional[str]:
+    """
+    Fallback header-based resolver, used only when a caller doesn't already
+    know the resolved user_id. app/main.py's _resolve_user_id() is the
+    authoritative resolver (it also translates an issued token's api_key
+    into its registered owner) -- callers there should pass user_id=
+    explicitly to save_session/load_session/clear_session instead of
+    relying on this, so the in-memory analysis session and this on-disk
+    snapshot can never disagree about who "the user" is for the same
+    request. This exists for callers with no access to that resolver.
+    """
     if request is None:
         return None
     for raw in (
@@ -63,14 +73,19 @@ def _current_user_id(request) -> Optional[str]:
     return None
 
 
-def user_session_root(request, directory: str = DEFAULT_DIR) -> str:
-    user_id = _current_user_id(request)
+def user_session_root(request, directory: str = DEFAULT_DIR, user_id: Optional[str] = None) -> str:
+    if user_id is None:
+        user_id = _current_user_id(request)
     slug = _slugify(user_id) if user_id else "anonymous"
     return os.path.join(directory, f"user_{slug}")
 
 
-def save_session(df, construct_dict: Dict[str, Any], optimized: Optional[Dict[str, Any]] = None, directory: str = DEFAULT_DIR, request=None, report: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    target = user_session_root(request, directory) if request is not None else directory
+def save_session(
+    df, construct_dict: Dict[str, Any], optimized: Optional[Dict[str, Any]] = None,
+    directory: str = DEFAULT_DIR, request=None, report: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+) -> Optional[str]:
+    target = user_session_root(request, directory, user_id) if (request is not None or user_id is not None) else directory
     _ensure_dir(target)
 
     df_path = os.path.join(target, "df.parquet")
@@ -106,8 +121,8 @@ def save_session(df, construct_dict: Dict[str, Any], optimized: Optional[Dict[st
         return None
 
 
-def load_session(directory: str = DEFAULT_DIR, request=None):
-    target = user_session_root(request, directory) if request is not None else directory
+def load_session(directory: str = DEFAULT_DIR, request=None, user_id: Optional[str] = None):
+    target = user_session_root(request, directory, user_id) if (request is not None or user_id is not None) else directory
 
     df_path = os.path.join(target, "df.parquet")
     cd_path = os.path.join(target, "construct_dict.json")
@@ -137,8 +152,8 @@ def load_session(directory: str = DEFAULT_DIR, request=None):
         return None, None, None
 
 
-def clear_session(directory: str = DEFAULT_DIR, request=None) -> None:
-    target = user_session_root(request, directory) if request is not None else directory
+def clear_session(directory: str = DEFAULT_DIR, request=None, user_id: Optional[str] = None) -> None:
+    target = user_session_root(request, directory, user_id) if (request is not None or user_id is not None) else directory
     for name in ["df.parquet", "construct_dict.json", "optimized_construct_dict.json", "meta.json", "df.csv"]:
         try:
             p = os.path.join(target, name)

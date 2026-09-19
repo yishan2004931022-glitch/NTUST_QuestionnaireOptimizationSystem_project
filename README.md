@@ -183,8 +183,7 @@ Use this checklist before exposing the API beyond a trusted admin network.
 
 - [ ] `API_KEY`: set a strong shared key in `.env`; rotate periodically.
 - [ ] `LLM_API_KEY`: store in a real secret manager instead of `.env` for production.
-- [ ] `SESSION_USER_ISOLATION=true`: activate per-user file paths.
-- [ ] `SESSION_USER_ROOT`: point to a mounted volume with quota/backup policy.
+- [ ] Per-user isolation: require every client to send a distinct `x-session-id` (or an issued token) -- without one, all callers share the `default` session.
 - [ ] `SESSION_TOKEN_TTL`: reduce from default `86400` to the minimum acceptable window.
 - [ ] CORS: lock `allow_origins` from `*` to your frontend origin(s).
 - [ ] TLS: terminate TLS at a reverse proxy (Nginx/Caddy/Traefik), not uvicorn.

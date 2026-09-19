@@ -44,7 +44,7 @@ def _parse_structural_sheet(sm_df: pd.DataFrame) -> Optional[Dict[str, List[str]
     return structural_model or None
 
 
-def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]], Optional[Dict[str, List[str]]]]:
+def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]], Optional[Dict[str, List[str]]], List[str], int]:
     """
     Load Excel/CSV and auto-detect construct dictionary from column names.
 
@@ -57,8 +57,24 @@ def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]], Option
     because the researcher explicitly wrote it into a second sheet of the
     same file, not because it was inferred from respondents' answers.
     CSV files and single-sheet Excel files simply return None here.
+
+    Returns (df, construct_dict, structural_model, demographic_columns,
+    rows_dropped_for_missing). demographic_columns holds column names that
+    never grouped with a sibling (single-item "constructs" like a Gender or
+    Age column) -- see the split below for why these must not be treated as
+    latent constructs needing reliability/AVE. rows_dropped_for_missing is
+    how many respondent rows the missing-value dropna() below removed, so
+    callers can tell the user their effective N shrank instead of it
+    happening silently.
     """
-    encodings = ["utf-8-sig", "utf-8", "latin1", "cp1252", "big5"]
+    # latin1/cp1252 are single-byte codecs that map every byte 0-255 to some
+    # character, so they NEVER raise UnicodeDecodeError -- they must come
+    # last, or a real multi-byte encoding (big5, used by Traditional Chinese
+    # questionnaires exported from a zh-TW Windows/Excel install) never gets
+    # a chance to run: the loop below "succeeds" on the byte-preserving but
+    # wrong latin1 decode first and returns silently mojibake'd column names
+    # (caught via Dataset_1.csv, a real big5-encoded dataset).
+    encodings = ["utf-8-sig", "utf-8", "big5", "cp1252", "latin1"]
     df = None
     last_err = None
     for enc in encodings:
@@ -76,7 +92,9 @@ def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]], Option
     # Trim header text to avoid BOM/spaces breaking construct detection
     df.columns = [str(c).strip() for c in df.columns]
 
+    rows_before = len(df)
     df = df.dropna()
+    rows_dropped_for_missing = rows_before - len(df)
 
     # Auto-detect construct dict from "ConstructName - ItemLabel" headers
     construct_dict: Dict[str, List[str]] = {}
@@ -92,8 +110,30 @@ def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]], Option
             if prefix:
                 plain_items.setdefault(prefix, []).append(col)
 
-    if not construct_dict and plain_items:
-        construct_dict = plain_items
+    # Merge, not replace-if-empty: a real file commonly mixes both styles
+    # (item columns using "Construct - Item" labels, demographic/control
+    # columns as plain single words with no digits to strip) -- treating
+    # them as alternatives meant a plain column silently vanished from
+    # both construct_dict and demographic_columns whenever the file had
+    # ANY " - " labelled column at all (caught via Dataset_1.csv, which
+    # is exactly this mixed shape).
+    for prefix, cols in plain_items.items():
+        construct_dict.setdefault(prefix, []).extend(cols)
+
+    # A prefix/label that only ever matched one column (e.g. "Gender", which
+    # has no digits to strip so it never merges with a sibling column) isn't
+    # a latent construct -- it's a standalone demographic/control column.
+    # Splitting this out here, at detection time, means every downstream
+    # consumer that just reads session["construct_dict"] gets a clean set
+    # for free instead of each having to re-derive "is this real" via its
+    # own len(items) >= 2 guess (or, as optimize_measurement did, not at all
+    # -- see DEVELOPMENT_LOG.md 階段 21 real-data test that caught this).
+    demographic_columns: List[str] = []
+    for construct in list(construct_dict.keys()):
+        items = construct_dict[construct]
+        if len(items) < 2:
+            demographic_columns.extend(items)
+            del construct_dict[construct]
 
     structural_model = None
     if not filepath.endswith(".csv"):
@@ -105,7 +145,7 @@ def load_data(filepath: str) -> Tuple[pd.DataFrame, Dict[str, List[str]], Option
         except Exception:
             structural_model = None
 
-    return df, construct_dict, structural_model
+    return df, construct_dict, structural_model, demographic_columns, rows_dropped_for_missing
 
 
 # ─────────────────────────────────────────────
@@ -341,7 +381,11 @@ def calc_bootstrapping(
 # Measurement Model Auto-Fix (Greedy AVE optimizer)
 # ─────────────────────────────────────────────
 
-def optimize_measurement(df: pd.DataFrame, construct_dict: Dict[str, List[str]]) -> dict:
+def optimize_measurement(
+    df: pd.DataFrame,
+    construct_dict: Dict[str, List[str]],
+    structural_model: Optional[Dict[str, List[str]]] = None,
+) -> dict:
     """
     Greedy algorithm:
     1. Flag items with loading < 0.7 as candidates for removal.
@@ -349,12 +393,46 @@ def optimize_measurement(df: pd.DataFrame, construct_dict: Dict[str, List[str]])
        until AVE >= 0.5 or only 2 items remain, preferring to remove flagged
        low-loading items first.
     Returns before/after construct dicts and per-construct change log.
+
+    A construct with fewer than 2 items can't have AVE/reliability computed
+    (both are undefined for a single item) and is skipped rather than judged
+    -- callers upstream (load_data) already route genuine demographic/control
+    columns away from construct_dict, but a caller can still hand this
+    function a raw dict containing one (e.g. a manually-typed construct_dict
+    body param), or a legitimate PLS-SEM single-indicator construct the
+    researcher declared in structural_model. Either way this must not be
+    silently dropped from the returned dict (a downstream structural_model
+    path referencing it would then vanish with no error) or count as a
+    Stage-A failure -- it's logged with its own action and passed through
+    unchanged instead.
     """
+    referenced = set()
+    if structural_model:
+        referenced = set(structural_model.keys()) | {v for vs in structural_model.values() for v in vs}
+
     log = []
     before_dict = {k: v[:] for k, v in construct_dict.items()}
     after_dict = {}
 
     for construct, items in construct_dict.items():
+        if len(items) < 2:
+            after_dict[construct] = items[:]
+            if construct in referenced:
+                log.append({
+                    "construct": construct, "action": "⚪ 單一指標構面",
+                    "detail": "PLS-SEM 單一指標構面慣例上不需要信效度檢驗，已在結構模型中原樣保留。",
+                    "removed_items": [], "final_items": items[:], "final_ave": None,
+                    "before_ave": None, "after_ave": None, "low_loading_items": [], "suggestion": None,
+                })
+            else:
+                log.append({
+                    "construct": construct, "action": "⚪ 略過（非測量構面）",
+                    "detail": "單一題項，非潛在構面（例如人口統計/控制欄位），不檢驗信效度。",
+                    "removed_items": [], "final_items": items[:], "final_ave": None,
+                    "before_ave": None, "after_ave": None, "low_loading_items": [], "suggestion": None,
+                })
+            continue
+
         current_items = items.copy()
         removed = []
         initial_result = calc_loadings_ave_cr(df, current_items) if current_items else {}
@@ -703,7 +781,7 @@ def optimize_unified(
     debugging/comparison against the pre-L1 behavior; do not disable it for
     a result that will be reported as anything other than exploratory.
     """
-    stage_a = optimize_measurement(df, construct_dict)
+    stage_a = optimize_measurement(df, construct_dict, structural_model)
     stage_a_passed = all(entry["action"] != "⚠️ 無可救藥" and entry["action"] != "❌ 計算錯誤" for entry in stage_a["log"])
     optimized_construct_dict = stage_a["optimized_construct_dict"]
 
