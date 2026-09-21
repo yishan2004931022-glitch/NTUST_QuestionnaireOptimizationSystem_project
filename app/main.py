@@ -1907,12 +1907,21 @@ async def _call_llm_chat(
             if not msg.tool_calls:
                 return msg.content or "", tool_results
 
+            def _tool_call_dict(tc):
+                d = {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                # Gemini's OpenAI-compat layer attaches extra_content.google.
+                # thought_signature to each tool call and 400s on the next
+                # turn ("missing thought_signature") if it isn't echoed back
+                # verbatim -- OpenAI/Groq never send or require this field,
+                # so this is a no-op for them (getattr just returns None).
+                extra = getattr(tc, "extra_content", None)
+                if extra:
+                    d["extra_content"] = extra
+                return d
+
             convo.append({
                 "role": "assistant", "content": msg.content,
-                "tool_calls": [
-                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in msg.tool_calls
-                ],
+                "tool_calls": [_tool_call_dict(tc) for tc in msg.tool_calls],
             })
             for tc in msg.tool_calls:
                 try:
