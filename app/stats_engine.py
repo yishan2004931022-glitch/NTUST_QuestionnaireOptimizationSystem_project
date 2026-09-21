@@ -287,16 +287,23 @@ def calc_reverse_item_flags(df: pd.DataFrame, construct_dict: Dict[str, List[str
 
 
 def calc_item_stems(construct_dict: Dict[str, List[str]]) -> Dict[str, str]:
-    """Map construct_key -> item_stem from headers of form 'Construct - ItemText'."""
-    stems = {}
-    for construct, items in construct_dict.items():
-        if not items:
-            continue
-        first = items[0]
-        if " - " in first:
-            stems[construct] = first.split(" - ", 1)[0].strip()
-        else:
-            stems[construct] = construct
+    """
+    Map item_key -> item wording, for headers of the form
+    "Construct - ItemText" (e.g. "信任 - 我相信...是可以信賴的").
+
+    Historically this took split(" - ", 1)[0] -- the CONSTRUCT name half,
+    not the item text half -- so every caller (including the LLM
+    suggestions prompt) was fed the construct's own name back as its
+    "stem" instead of the actual question wording, for every item. Column
+    names with no " - " (e.g. "TE1") carry no embedded item text at all,
+    so there is nothing to extract for those -- callers should treat a
+    missing key here as "no wording available for this item".
+    """
+    stems: Dict[str, str] = {}
+    for items in construct_dict.values():
+        for item in items:
+            if " - " in item:
+                stems[item] = item.split(" - ", 1)[1].strip()
     return stems
 
 

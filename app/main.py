@@ -1374,7 +1374,11 @@ CHAT_SYSTEM_PROMPT = (
     "那幾乎一定是在講結構路徑，要放進 structural_model，不要放進 construct_dict。不確定就直接問使用者，不要用工具亂猜。\n"
     "6. 工具呼叫失敗時，先讀懂錯誤訊息裡的原因再決定下一步；絕對不要用完全一樣的參數重複呼叫同一個工具——"
     "如果修正後還是不確定要怎麼做，就停下來，直接跟使用者說卡在哪裡、需要什麼資訊，不要一直重試。\n"
-    "7. 用繁體中文回覆。"
+    "7. 講低負荷題項（low_loading_flags）時，如果工具結果裡的 item_stems 有這個題項的文字，"
+    "要把題目文字引用出來再給建議，不要只講題項代號；item_stems 沒有這個題項就照實說「這份資料沒有題目文字，只能就數字本身判斷」，不要編。\n"
+    "8. 結構路徑結果裡的 unexpected_direction_paths（顯著但方向為負的路徑）要主動特別標出來、提醒使用者這種方向較少見，"
+    "值得檢查是不是反向題沒處理好、共線性、或這本身就是一個值得在論文裡討論的意外發現——不要跟其他顯著路徑一樣輕描淡寫地帶過。\n"
+    "9. 用繁體中文回覆。"
 )
 
 CHAT_TOOLS_OPENAI = [
@@ -1458,7 +1462,11 @@ STAGED_CHAT_SYSTEM_PROMPT = (
     "structural_model 參數只能放「構面名稱」，不確定使用者說的是題項還是構面就直接問，不要用工具亂猜。\n"
     "6. 工具呼叫失敗時，先讀懂錯誤訊息裡的原因再決定下一步；絕對不要用完全一樣的參數重複呼叫同一個工具，"
     "卡住就直接跟使用者說卡在哪裡，不要一直重試。\n"
-    "7. 用繁體中文回覆。"
+    "7. 講低負荷題項（low_loading_flags）時，如果工具結果裡的 item_stems 有這個題項的文字，"
+    "要把題目文字引用出來再給建議，不要只講題項代號；item_stems 沒有這個題項就照實說「這份資料沒有題目文字，只能就數字本身判斷」，不要編。\n"
+    "8. 結構路徑結果裡的 unexpected_direction_paths（顯著但方向為負的路徑）要主動特別標出來、提醒使用者這種方向較少見，"
+    "值得檢查是不是反向題沒處理好、共線性、或這本身就是一個值得在論文裡討論的意外發現——不要跟其他顯著路徑一樣輕描淡寫地帶過。\n"
+    "9. 用繁體中文回覆。"
 )
 
 STAGED_CHAT_TOOLS_OPENAI = [
@@ -1583,6 +1591,11 @@ def _compute_measurement_structural(session: Dict) -> dict:
         "reliability": reliability,
         "convergent_validity": convergent,
         "low_loading_flags": low_loading_flags,
+        # Item wording (only available for "Construct - ItemText" headers) so
+        # the chat assistant can reason about *why* a specific item is weak
+        # instead of only reporting that it is -- without this it never had
+        # the item's actual content to reference at all.
+        "item_stems": calc_item_stems(construct_dict),
         "summary": {"latent_constructs": total_latent, "ave_passed": ave_passed, "alpha_passed": alpha_passed},
     }
 
@@ -1595,8 +1608,17 @@ def _compute_measurement_structural(session: Dict) -> dict:
         structural = {"blocked_by_l2_gate": True, "blocked_constructs": l2_blocked}
     else:
         try:
+            bootstrapping = calc_bootstrapping(df, latent_constructs, structural_model, 300)
             structural = {
-                "bootstrapping": calc_bootstrapping(df, latent_constructs, structural_model, 300),
+                "bootstrapping": bootstrapping,
+                # A significant path with a negative beta is far less common
+                # than a positive one in most theorized models and is worth
+                # the researcher double-checking (reverse-coding, multi-
+                # collinearity, or a genuine unexpected finding) -- flagged
+                # explicitly here so the LLM doesn't rubber-stamp it the same
+                # as every other significant path (see CHAT_SYSTEM_PROMPT /
+                # STAGED_CHAT_SYSTEM_PROMPT rule that reads this field).
+                "unexpected_direction_paths": [p["path"] for p in bootstrapping if p.get("significant") and p.get("beta", 0) < 0],
                 "vif": calc_vif(df, latent_constructs, structural_model),
                 "r_squared": calc_r_squared(df, latent_constructs, structural_model),
             }
@@ -1752,6 +1774,80 @@ def _trim_tool_result_for_llm(name: str, result: dict) -> dict:
     return _strip_optimize_bulk_fields(copy.deepcopy(result))
 
 
+# ─── Chat history trimming ─────────────────────────────────────────
+# _trim_tool_result_for_llm above shrinks one tool result; it does nothing
+# about the conversation growing across TURNS. Tool-call JSON itself is
+# never persisted into session chat history (see _call_llm_chat's
+# docstring), but the assistant's own reply text is (chat()/chat_staged()
+# both do history.append({"role": "assistant", "content": reply})) --
+# and those replies are full markdown tables reproducing L1-L4 results.
+# By the 3rd-4th turn that alone routinely exceeds a small model's
+# per-minute token budget (hit in practice: Groq's 8000 TPM limit on
+# openai/gpt-oss-120b, request already at 8436 tokens). The full raw
+# history is still kept in session state and in audit_log either way --
+# this only shrinks what actually gets sent to the LLM.
+
+MAX_RAW_CHAT_TURNS = 8  # last N raw {role, content} messages sent verbatim
+
+
+def _summarize_pipeline_state(session: Dict) -> str:
+    """Deterministic one-paragraph recap of what's already been computed
+    this session, built from session["last_pipeline_result"] -- never from
+    an LLM call (would cost tokens/an extra round-trip to solve a token
+    budget problem, and can't hallucinate a number that isn't there)."""
+    result = session.get("last_pipeline_result") or {}
+    parts = []
+
+    dq = result.get("data_quality")
+    if isinstance(dq, dict) and dq.get("total_respondents") is not None:
+        parts.append(f"L1 資料品質：{dq.get('flagged_count')}/{dq.get('total_respondents')} 筆待複查")
+
+    measurement = result.get("measurement")
+    if isinstance(measurement, dict):
+        s = measurement.get("summary", {})
+        parts.append(f"L2 測量模型：{s.get('alpha_passed')}/{s.get('latent_constructs')} 構面信度過關、{s.get('ave_passed')}/{s.get('latent_constructs')} 構面效度過關")
+
+    structural = result.get("structural")
+    if isinstance(structural, dict) and structural.get("bootstrapping"):
+        sig = [p["path"] for p in structural["bootstrapping"] if p.get("significant")]
+        insig = [p["path"] for p in structural["bootstrapping"] if not p.get("significant")]
+        parts.append(f"L3 結構路徑：顯著 {sig or '無'}；不顯著 {insig or '無'}")
+
+    opt = result.get("optimize_full_search")
+    if isinstance(opt, dict):
+        parts.append(f"L4 優化搜尋：{opt.get('status')}")
+
+    if not parts:
+        return ""
+    return (
+        "（系統提示，非使用者本人輸入，是先前對話的摘要）目前為止已完成：" + "；".join(parts) + "。"
+        "更早的對話原文因為篇幅過長已經省略，回覆時延續這個進度即可，不用重新詢問或重新執行已經做過的步驟。"
+    )
+
+
+def _build_llm_messages(history: List[Dict], session: Dict) -> List[Dict]:
+    """What actually gets sent to the LLM for this turn -- the stored
+    session history itself is never truncated (it's still the full record
+    for /chat/history and audit purposes), only this outgoing view is."""
+    if len(history) <= MAX_RAW_CHAT_TURNS:
+        return history
+    kept = history[-MAX_RAW_CHAT_TURNS:]
+    summary = _summarize_pipeline_state(session)
+    return ([{"role": "user", "content": summary}] if summary else []) + kept
+
+
+def _friendly_llm_error(exc: Exception) -> str:
+    """Map a raw provider exception to a message safe to show an end user.
+    Provider errors (esp. Groq via the openai-compatible client) can
+    include internal org ids and billing upsell links in their raw text --
+    never forward str(exc) to the client; log it server-side instead."""
+    logger.warning("LLM call failed: %s", exc)
+    status = getattr(exc, "status_code", None)
+    if status in (429, 413):
+        return "目前這段對話內容有點多，AI 一次讀不完（LLM 服務的流量/長度限制）。建議開新的對話重新開始，或把問題拆成比較短的幾句話再試一次。"
+    return "LLM 服務暫時無法回應，請稍後再試一次；如果一直發生，麻煩告訴系統管理員。"
+
+
 MAX_CHAT_TOOL_ITERATIONS = 4
 CHAT_TOOL_LIMIT_MESSAGE = "（這一輪已經連續呼叫太多次工具、而且沒有成功，先停在這裡——上面列出的是每次嘗試失敗的原因，可以參考後換句話再說一次，或把要求拆成比較小的步驟分開講。）"
 REPEAT_TOOL_CALL_RESULT = {
@@ -1893,7 +1989,7 @@ async def chat(request: Request, body: ChatInput):
 
     try:
         reply, tool_results = await _call_llm_chat(
-            provider=provider, api_key=api_key, model=model, messages=history,
+            provider=provider, api_key=api_key, model=model, messages=_build_llm_messages(history, session),
             temperature=float(body.temperature or 0.3), max_tokens=int(body.max_tokens or 1500),
             base_url=base_url, session=session, request=request,
         )
@@ -1902,7 +1998,7 @@ async def chat(request: Request, body: ChatInput):
         raise
     except Exception as e:
         history.pop()
-        raise HTTPException(status_code=500, detail=f"LLM 呼叫失敗：{e}")
+        raise HTTPException(status_code=500, detail=_friendly_llm_error(e))
 
     history.append({"role": "assistant", "content": reply})
 
@@ -1956,7 +2052,7 @@ async def chat_staged(request: Request, body: ChatInput):
 
     try:
         reply, tool_results = await _call_llm_chat(
-            provider=provider, api_key=api_key, model=model, messages=history,
+            provider=provider, api_key=api_key, model=model, messages=_build_llm_messages(history, session),
             temperature=float(body.temperature or 0.3), max_tokens=int(body.max_tokens or 1500),
             base_url=base_url, session=session, request=request,
             system_prompt=STAGED_CHAT_SYSTEM_PROMPT,
@@ -1967,7 +2063,7 @@ async def chat_staged(request: Request, body: ChatInput):
         raise
     except Exception as e:
         history.pop()
-        raise HTTPException(status_code=500, detail=f"LLM 呼叫失敗：{e}")
+        raise HTTPException(status_code=500, detail=_friendly_llm_error(e))
 
     history.append({"role": "assistant", "content": reply})
 
@@ -2158,7 +2254,7 @@ async def optimization_discussion_message(request: Request, optimization_session
             base_url=body.base_url or os.environ.get("LLM_BASE_URL", ""), session=session, request=request,
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"LLM 呼叫失敗：{exc}")
+        raise HTTPException(status_code=500, detail=_friendly_llm_error(exc))
     audit_db.add_optimization_message(optimization_session_id, "assistant", reply)
 
     # If the LLM asks the existing optimizer to re-run, retain its exact
